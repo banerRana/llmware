@@ -1,4 +1,3 @@
-
 # Copyright 2023 llmware
 
 # Licensed under the Apache License, Version 2.0 (the "License"); you
@@ -12,20 +11,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 # implied.  See the License for the specific language governing
 # permissions and limitations under the License.
+"""The prompts module implements the Prompt class, which manages the inference process. This includes
+pre-processing, executing, and post-processing of inferences and tracking the state of related inferences,
+e.g. in conversational language models.
+
+The module also implements the Sources, QualityCheck, and HumanInTheLoop classes. The Sources class packages
+retrieved sources and appends them to a prompt. The QualityCheck class compares (i.e. verifies) the LLMs'
+response against the context information. Finally, the HumanInTheLoop class provides mechanisms for reviews,
+which includes access to the prompt history for corrections, as well as user ratings.
+"""
 
 
-from bson import ObjectId
+# from bson import ObjectId
 import statistics
-from collections import Counter
+# from collections import Counter
 import re
 import time
 import logging
 import os
 import torch
 
-from llmware.util import Utilities, CorpTokenizer, PromptCatalog, YFinance, Graph
+from llmware.util import Utilities, CorpTokenizer, YFinance, Graph
 from llmware.resources import PromptState
-from llmware.models import ModelCatalog
+from llmware.models import ModelCatalog, PromptCatalog
 from llmware.parsers import Parser
 from llmware.retrieval import Query
 from llmware.library import Library
@@ -34,7 +42,72 @@ from llmware.configs import LLMWareConfig
 
 
 class Prompt:
+    """Implements the actions of the prompt process, which includes the actions pre-processing, execution,
+    post-processing, and managing the state of related inferences.
 
+    ``Prompt`` is responsible for pre-processing, executing, and post-processing of inferences and for
+    managing end-to-end state of a series of related inferences.
+
+    Parameters
+    ----------
+    llm_name : str, default=None
+        The name of the llm to be used.
+
+    tokenizer : object, default=None
+        The tokenzier to use. The default is to use the tokenizer specified by the ``Utilities`` class.
+
+    model_card : dict, default=None
+        A dictionary describing the model to be used. If the dictionary contains the key ``model_name``,
+        then this model will be used instead of the one set by ``llm_name``. In other words, ``model_card``
+        overrides ``llm_name``.
+
+    library : object, default=None
+        A ``Library`` object.
+
+    account_name : str, default="llmware"
+        The name of the account to be used. This is one of the states a the prompt.
+
+    prompt_id : int, default=None
+        The ID of the prompt. If a prompt ID is given, then the state of this prompt is loaded. Otherwise, a
+        new prompt ID is generated. This is part of the state of a prompt.
+
+    save_state : bool, default=True
+        Actually, this is a dead variable and should be removed in a future release.
+
+    llm_api_key : str, default=None
+        The API key that is used to load the large language model.
+
+    llm_model : str, default=None
+        The name of the model to load.
+
+    from_hf : bool, default=False
+        Indicates whether the model should be loaded from hugging face.
+
+    prompt_catalog : object, default=None
+        An object of type ``PromptCatalog``.
+
+    temperature : float, default=0.5
+        Sets the temperature of the large language model.
+
+    prompt_wrapper : str, default="human_bot"
+        Sets the prompt wrapper. Possible values are "alpaca", "human_bot", "chatgpt", "<INST>", "open_chat",
+        "hf_chat", and "chat_ml".
+
+    instruction_following : bool, default=False
+        Sets whether the large language model should follow instructions. Note that this has an effect
+        if and only if the model specified has a version that is trained to follow instructions.
+
+    Examples
+    ----------
+    >>> import os
+    >>> from llmware.prompts import Prompt
+    >>> openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+    >>> prompter = Prompt(llm_name='gpt-4', llm_api_key=openai_api_key)
+    >>> prompt = 'How old is my brother?'
+    >>> context = 'My brother is 20 years old and my sister is 1.5 times older'
+    >>> response = prompter.prompt_main(prompt=prompt, context=context)
+    >>> response['llm_response']
+    """
     def __init__(self, llm_name=None, tokenizer=None, model_card=None, library=None, account_name="llmware",
                  prompt_id=None, save_state=True, llm_api_key=None, llm_model=None, from_hf=False,
                  prompt_catalog=None, temperature=0.5, prompt_wrapper="human_bot", instruction_following=False):
@@ -158,14 +231,20 @@ class Prompt:
             os.mkdir(self.prompt_path)
             os.chmod(self.prompt_path, 0o777)
 
-    # changes in importing huggingface models
-    def load_model(self, gen_model,api_key=None, from_hf=False, trust_remote_code=False):
+    def load_model(self, gen_model,api_key=None, from_hf=False, trust_remote_code=False,
+                   # new options added
+                   use_gpu=True, sample=True, get_logits=False,
+                   max_output=200, temperature=-99):
+
+        """Load model into prompt object by selecting model name """
 
         if api_key:
             self.llm_model_api_key = api_key
 
         if not from_hf:
-            self.llm_model = self.model_catalog.load_model(gen_model, api_key=self.llm_model_api_key)
+            self.llm_model = self.model_catalog.load_model(gen_model, api_key=self.llm_model_api_key,
+                                                           use_gpu=use_gpu, sample=sample, get_logits=get_logits,
+                                                           max_output=max_output, temperature=temperature)
         else:
             try:
                 # will wrap in Exception if import fails and move to model catalog class
@@ -196,17 +275,21 @@ class Prompt:
 
         self.llm_name = gen_model
         self.context_window_size = self.llm_model.max_input_len
+        self.llm_max_output_len = max_output
 
         return self
 
     def set_inference_parameters(self, temperature=0.5, llm_max_output_len=200):
+
+        """ Convenience method to set inference parameters directly in prompt. """
+
         self.temperature = temperature
         self.llm_max_output_len = llm_max_output_len
         return self
 
     def get_current_history(self, key_list=None):
 
-        # will return selected state vars from current prompt session, based on key list
+        """ Will return selected state vars from current prompt session, based on key list """
 
         if not key_list:
             key_list = self.llm_state_vars
@@ -221,16 +304,22 @@ class Prompt:
         return output_dict
 
     def clear_history(self):
-        # removes elements from interaction history
+
+        """ Removes elements from interaction history """
+
         self.interaction_history = []
         self.dialog_tracker = []
         return self
 
     def clear_source_materials(self):
+
+        """ Clears the source materials from the prompt to start with fresh set of sources """
         self.source_materials = []
         return self
 
     def register_llm_inference (self, ai_dict, prompt_id=None, trx_dict=None):
+
+        """ Registers the llm inference to prompt state """
 
         if not prompt_id:
             prompt_id = self.prompt_id
@@ -256,10 +345,16 @@ class Prompt:
         return ai_dict
 
     def lookup_llm_trx_all (self):
+
+        """ Look up saved llm transactions persisted to file in prompt history """
+
         ai_trx_list = PromptState(self).full_history()
         return ai_trx_list
 
     def load_state(self, prompt_id, clear_current_state=True):
+
+        """ Loads an existing prompt history state by prompt_id from prompt history """
+
         PromptState(self).load_state(prompt_id,clear_current_state=clear_current_state)
         for entries in self.interaction_history:
             self.dialog_tracker.append({"user": entries["prompt"], "bot": entries["llm_response"]})
@@ -267,20 +362,31 @@ class Prompt:
         return self
 
     def save_state(self):
+
+        """ Saves the state of the prompt and writes to prompt history file """
+
         PromptState(self).save_state(self.prompt_id)
         return self
 
     def lookup_by_prompt_id (self, prompt_id):
+
+        """ Look up specific prompts by prompt_id """
+
         ai_trx_list = PromptState(self).lookup_by_prompt_id(prompt_id)
         return ai_trx_list
 
     def lookup_ai_trx_with_filter(self, filter_dict):
+
+        """ Look up prompts by filter dictionary """
+
         ai_trx_list = PromptState(self).lookup_prompt_with_filter(filter_dict)
         return ai_trx_list
 
     # prepare sources
 
     def add_source_new_query(self, library, query=None, query_type="semantic", result_count=10):
+
+        """ Attach a new source to a prompt object by running a new query against a library. """
 
         # step 1 - run selected query against library
         query_results = Query(library).query(query,query_type=query_type, result_count=result_count, results_only=True)
@@ -296,6 +402,8 @@ class Prompt:
 
     def add_source_query_results(self, query_results):
 
+        """ Attach a new source to a prompt object by passing directly the query results from a previous query. """
+
         #       example use - run a query directly, and then 'add' the query results to a prompt
         #       query_results = Query(self.library).semantic_query("what is the duration of the non-compete clause?")
         #       prompter = Prompt().load_model("claude-instant-v1",api_key="my_api_key")
@@ -310,6 +418,9 @@ class Prompt:
         return sources
 
     def add_source_library(self, library_name):
+
+        """ Attach a new source to a prompt object by passing an entire library - note: only recommended if the library
+        consists of a very small number of documents. """
 
         #       example use - created a small library with a few key documents in a previous step
         #       my_lib.add_documents(fp)
@@ -327,6 +438,8 @@ class Prompt:
         return sources
 
     def add_source_wikipedia(self, topic, article_count=3, query=None):
+
+        """ Attach a wikipedia source to a prompt object by selecting a topic and count of requested articles. """
 
         # step 1 - get wikipedia article
         output = Parser().parse_wiki([topic],write_to_db=False,target_results=article_count)
@@ -348,6 +461,8 @@ class Prompt:
         return sources
 
     def add_source_yahoo_finance(self, ticker=None, key_list=None):
+
+        """ Attach a source to a prompt object by selecting a ticker from Yahoo Finance. """
 
         #   example:    primary use is to quickly grab a factset about a specific company / stock ticker
         #               and 'inject' real-time, up-to-date fact set into the prompt to minimize hallucination risk
@@ -378,8 +493,10 @@ class Prompt:
 
         return sources
 
-    # TODO - WIP - how to pass/add knowledge graph context to a prompt
     def add_source_knowledge_graph(self, library, query):
+
+        """ Attach a new source to a prompt object consisting of summary output elements from knowledge graph.  This is
+        a WIP / experimental method - and will likely evolve.  """
 
         # need to check for library and for graph
         if library:
@@ -414,6 +531,8 @@ class Prompt:
 
     def add_source_website(self, url, query=None):
 
+        """ Attach a website source to a prompt object by identifying the url name. """
+
         # get website content
         output = Parser().parse_website(url,write_to_db=False,max_links=3)
 
@@ -432,6 +551,9 @@ class Prompt:
         return sources
 
     def add_source_document(self, input_fp,input_fn, query=None):
+
+        """ Attach a document directly to a prompt object by passing the folder path and file name of the source
+        document, and an optional query filter. """
 
         #   example:  intended for use to rapidly parse and add a document (of any type) from local file to a prompt
 
@@ -453,7 +575,7 @@ class Prompt:
 
     def add_source_last_interaction_step(self):
 
-        # will take the last interaction and add to source, useful in conversational dialog
+        """ Adds the last interaction step directly into the source to enable 'interactive dialog'. """
 
         interaction= ""
         if len(self.dialog_tracker) > 0:
@@ -473,6 +595,8 @@ class Prompt:
 
     def review_sources_summary(self):
 
+        """ Review the sources and provide summary. """
+
         #   Source metadata for each entry -    ["batch_id", "text", "metadata", "biblio", "batch_stats",
         #                                       "batch_stats.tokens", "batch_stats.chars", "batch_stats.samples"]
 
@@ -489,7 +613,7 @@ class Prompt:
 
     def verify_source_materials_attached(self):
 
-        # returns True if text present in source materials, else False
+        """ Verifies if source materials attached. Returns True if text present in source materials, else False. """
 
         source_materials_attached = False
 
@@ -505,6 +629,8 @@ class Prompt:
 
     def prompt_with_source(self, prompt, prompt_name=None, source_id_list=None, first_source_only=True,
                            max_output=None, temperature=None):
+
+        """ Inference method - uses the prepared source, along with prompt/question, and calls loaded model. """
 
         #   this method is intended to be used in conjunction with sources as follows:
         #           prompter = Prompt().load_model("claude-instant-v1", api_key=None)
@@ -612,6 +738,8 @@ class Prompt:
 
     def select_prompt_from_catalog(self, prompt_name):
 
+        """ Selects a prompt style from the catalog. """
+
         if prompt_name in self.pc.list_all_prompts():
             self.prompt_type = prompt_name
         else:
@@ -620,6 +748,8 @@ class Prompt:
         return self
 
     def prompt_from_catalog(self, prompt, context=None, prompt_name=None, inference_dict=None):
+
+        """ Inference method - runs a prompt by loading a specific prompt style from the catalog. """
 
         if prompt_name not in self.pc.list_all_prompts():
             raise PromptNotInCatalogException(prompt_name)
@@ -631,11 +761,17 @@ class Prompt:
 
     # useful 'out of the box' prompts
     def number_or_none(self, prompt, context=None):
+
+        """ Inference method - convenience method using 'number_or_none' prompt style instruction. """
+
         # rename - "facts_or_not_found"
         output = self.prompt_from_catalog(prompt, context=context,prompt_name="number_or_none")
         return output
 
     def summarize_with_bullets(self, prompt, context, number_of_bullets=5):
+
+        """ Inference method - convenience method using 'summarize_with_bullets' prompt style and configurable
+        number of 'bullets' requested. """
 
         #   useful 'out of the box' summarize capability with ability to parameterize the number_of_bullets
         #   note: most models are 'approximately' accurate when specifying a number of bullets
@@ -648,12 +784,16 @@ class Prompt:
 
     def yes_or_no(self, prompt, context):
 
+        """ Inference method - convenience method using 'yes_no' prompt style. """
+
         #   useful classification prompt, assumes prompt is a question that expects a "yes" or "no" answer
         response = self.prompt_from_catalog(prompt, context=context,prompt_name="yes_no")
 
         return response
 
     def completion(self, prompt, temperature=0.7, target_len=200):
+
+        """ Inference method - convenience method for a basic text completion. """
 
         self.llm_model.temperature = temperature
         self.llm_model.ai_max_output_len = target_len
@@ -663,6 +803,8 @@ class Prompt:
         return response
 
     def multiple_choice(self, prompt, context, choice_list):
+
+        """ Inference method - prepares a multiple choice question prompt, using prompt, context and choice list. """
 
         prompt += "\nWhich of the following choices best answers the question - "
         for i, choice in enumerate(choice_list):
@@ -677,6 +819,9 @@ class Prompt:
 
     def xsummary(self, context, number_of_words=20):
 
+        """ Inference method - uses 'xsummary' prompt style and configurable number of requested words for
+        short summaries."""
+
         #   provides an 'extreme summary', e.g., 'xsum' with ability to parameterize the number of words
         #   --most models are reasonably accurate when asking for specific number of words
 
@@ -687,6 +832,8 @@ class Prompt:
         return response
 
     def title_generator_from_source (self, prompt, context=None, title_only=True):
+
+        """ Inference method - uses 'report_title' prompt style to produce titles based on prompt and context. """
 
         response = self.prompt_from_catalog(prompt, context=context,prompt_name="report_title")
 
@@ -699,6 +846,8 @@ class Prompt:
     def prompt_main (self, prompt, prompt_name=None, context=None, call_back_attempts=1, calling_app_id="",
                      prompt_id=0,batch_id=0, trx_dict=None, selected_model= None, register_trx=False,
                      inference_dict=None, max_output=None, temperature=None):
+
+        """ Main inference method to execute inference on loaded model. """
 
         usage = {}
 
@@ -803,14 +952,15 @@ class Prompt:
         output_dict.update({"evidence_metadata": [{"evidence_start_char":0,
                                                    "evidence_stop_char": evidence_stop_char,
                                                    "page_num": "NA",
-                                                   "source_name": "NA"}]})
+                                                   "source_name": "NA",
+                                                   "doc_id": "NA",
+                                                   "block_id": "NA"}]})
 
         if register_trx:
             self.register_llm_inference(output_dict,prompt_id,trx_dict)
 
         return output_dict
 
-    # new method
     def _doc_summarizer_old_works(self, query_results, max_batch_size=100, max_batch_cap=None,key_issue=None):
 
         # runs core summarization loop thru document
@@ -849,10 +999,10 @@ class Prompt:
 
         return response
 
-    # new method
     def _doc_summarizer(self, query_results, max_batch_cap=None,key_issue=None):
 
-        # runs core summarization loop thru document
+        """ Runs Core summarization loop through a selected document. """
+
         response = []
 
         source = self.add_source_query_results(query_results)
@@ -883,6 +1033,9 @@ class Prompt:
     def summarize_document(self, input_fp,input_fn, query=None, text_only=True, max_batch_cap=10,
                            key_issue=None):
 
+        """ Returns a document summary from input folder path and file name, along with any optional
+        query filter and key issue. """
+
         output = Parser().parse_one(input_fp,input_fn)
 
         # run in memory filtering to sub-select from document only items matching query
@@ -908,6 +1061,8 @@ class Prompt:
     # new method - document summarization from library
     def summarize_document_from_library(self, library, doc_id=None, filename=None, query=None,
                                         text_only=True,max_batch_cap=10):
+
+        """ Returns a document summary - based on a selected document ID from a library. """
 
         # need to handle error
         if not doc_id and not filename:
@@ -950,8 +1105,9 @@ class Prompt:
         else:
             return response
 
-    # useful "call backs"
     def summarize_multiple_responses(self, list_of_response_dict=None, response_id_list=None):
+
+        """ Summarizes multiple responses from previous inferences as a 'second-level' summary. """
 
         batch = None
 
@@ -971,6 +1127,9 @@ class Prompt:
         return aggregated_response_dict
 
     def select_among_multiple_responses(self, list_of_response_dict=None, response_id_list=None):
+
+        """ Aggregates multiple previous responses and passes as a 'second-level' inference to select the best
+        answer. """
 
         batch = None
 
@@ -993,6 +1152,9 @@ class Prompt:
 
     def evidence_check_numbers(self, response):
 
+        """ Runs analysis of the numbers in the llm_response and attempts to verify the values of those numbers
+        in the source materials.  Returns an updated list of response dictionaries, enriched with "fact_check" key. """
+
         # expect that response is a list of response dictionaries
         if isinstance(response, dict):
             response = [response]
@@ -1011,6 +1173,10 @@ class Prompt:
 
     def evidence_check_sources(self, response):
 
+        """ Runs analysis of the llm_response and uses statistical token-matching with the source materials to
+        try to identify a smaller 'snippet' that is the most likely source with metadata of file and page number.
+        Returns an updated list of response dictionaries, enriched with 'source_review' key. """
+
         # expect that response is a list of response dictionaries
         if isinstance(response, dict):
             response = [response]
@@ -1027,6 +1193,11 @@ class Prompt:
         return response_out
 
     def evidence_comparison_stats(self, response):
+
+        """ Runs analysis of the llm_response and uses statistical token-matching with the source materials to provide
+        an overall comparison 'match' level which can be a good quantitative indicator if the model output has
+        hallucinated or deviated materially from the source.  Returns an updated list of response dictionaries,
+        enriched with 'comparison_stats' key. """
 
         # expect that response is a list of response dictionaries
         if isinstance(response, dict):
@@ -1045,6 +1216,9 @@ class Prompt:
 
     def classify_not_found_response(self, response_list,parse_response=True,evidence_match=True,ask_the_model=False):
 
+        """ Takes a list of response dictionaries as input, and then runs tests to validate if the llm_response
+        appears to be 'not found'."""
+
         output_response_all = []
 
         if isinstance(response_list,dict):
@@ -1059,6 +1233,8 @@ class Prompt:
         return output_response_all
 
     def _classify_not_found_one_response(self, response_dict, parse_response=True, evidence_match=True, ask_the_model=False):
+
+        """ Internal utility helper to classify a single response."""
 
         output_response = {}
         nf = []
@@ -1099,26 +1275,69 @@ class Prompt:
 
     def send_to_human_for_review(self, output_path=None, output_fn=None):
 
+        """ Exports the current prompt interaction to a CSV for follow-up review by a person. """
+
         output = HumanInTheLoop(prompt=self).export_current_interaction_to_csv(output_path=output_path,report_name=output_fn)
         return output
 
     def apply_user_ratings(self, ratings_dict):
+
+        """ Adds a human rating to a response dictionary - useful to upstream applications to enable and capture
+        user input. """
 
         output = HumanInTheLoop(prompt=self).add_or_update_human_rating(self.prompt_id,ratings_dict)
         return output
 
     def apply_user_corrections(self, updates_dict):
 
+        """ Enables a user to manually update llm_responses as second-level human-in-the-loop review in upstream
+        application. """
+
         output = HumanInTheLoop(prompt=self).update_llm_response_record(self.prompt_id,updates_dict,keep_change_log=True)
         return output
 
 
 class Sources:
+    """Implements a source, which is for example a document that is appended to a prompt. It is used
+    by the ``Prompt`` class.
 
-    #       Sources can accept any Python iterable consisting of dictionary entries
-    #       Each dictionary entry must support minimally the keys in self.source_input_keys
-    #       By default, this is a minimum of 3 keys - "text", "file_source", "page_num"
+    ``Sources`` is responsible for adding a source (sometines also called a knowledge source) to a prompt.
+    It accepts a Python iterable consisting of dictionary entries, where the dictionary has to have
+    the keys "text", "file_source", "page_num".
 
+    Parameters
+    ----------
+    prompt : object
+        An object of type ``Prompt``.
+
+    Examples
+    ----------
+    >>> import os
+    >>> from llmware.setup import Setup
+    >>> from llmware.library import Library
+    >>> from llmware.prompts import Prompt
+    >>> library = Library().create_new_library('prompt_with_sources')
+    >>> sample_files_path = Setup().load_sample_files(over_write=False)
+    >>> parsing_output = library.add_files(os.path.join(sample_files_path, "Agreements"))
+    >>> prompt = Prompt().load_model('llmware/bling-1b-0.1')
+    >>> prompt.add_source_document(os.path.join(sample_files_path, "Agreements"), 'Apollo EXECUTIVE EMPLOYMENT AGREEMENT.pdf')
+    >>> result = prompt.prompt_with_source(prompt='What is the base salery amount?', prompt_name='default_with_context')
+    >>> type(result)
+    <class 'list'>
+    >>> len(result)
+    1
+    >>> type(result[0])
+    <class 'dict'>
+    >>> result[0].keys()
+    dict_keys(['llm_response', 'prompt', 'evidence', 'instruction', 'model', 'usage',
+               'time_stamp', 'calling_app_ID', 'rating', 'account_name', 'prompt_id',
+               'batch_id', 'evidence_metadata', 'biblio', 'event_type', 'human_feedback',
+               'human_assessed_accuracy'])
+    >>> result[0]['biblio']
+    {'Apollo EXECUTIVE EMPLOYMENT AGREEMENT.pdf': ['1']}
+    >>> result[0]['llm_response']
+    ' $1,000,000.00'
+    """
     def __init__(self, prompt):
 
         self.prompt= prompt
@@ -1132,22 +1351,28 @@ class Sources:
                             "batch_stats.chars", "batch_stats.samples"]
 
         self.source_metadata = ["batch_source_num", "evidence_start_char", "evidence_stop_char",
-                                "source_name", "page_num"]
+                                "source_name", "page_num", "doc_id", "block_id"]
 
     def token_counter(self, text_sample):
+
+        """ Token counter utility """
+
         toks = self.tokenizer.encode(text_sample).ids
         return len(toks)
 
     def tokenize (self, text_sample):
+
+        """ Tokenize utility """
+
         toks = self.tokenizer.encode(text_sample).ids
         return toks
 
     def package_source(self, retrieval_material, aggregate_source=True, add_to_prompt=True,
                        backup_source_filename="user_provided_unknown_source"):
 
-        # generalized source packager
-        #   --assumes minimal metadata - doc_name, page_num and text chunk
-        #   --add to existing 'state' source & create new batch on top if overflow
+        """ Generalized source packager
+           --assumes minimal metadata - doc_name, page_num and text chunk
+           --add to existing 'state' source & create new batch on top if overflow  """
 
         # tracking variables
         tokens_per_batch = []
@@ -1234,6 +1459,18 @@ class Sources:
                     # if can not retrieve from metadata, then set as default - page 1
                     page_num = 1
 
+            if "doc_id" in samples[x]:
+                    doc_id = samples[x]["doc_id"]
+            else:
+                    # if can not retrieve from metadata, then set as default - doc_id 1
+                    doc_id = 1
+
+            if "block_id" in samples[x]:
+                    block_id = samples[x]["block_id"]
+            else:
+                    # if can not retrieve from metadata, then set as default - block_id 1
+                    block_id = 1
+
             # keep aggregating text batch up to the size of the target context_window for selected model
             if (t + token_counter) < self.prompt.context_window_size:
 
@@ -1247,6 +1484,8 @@ class Sources:
                               "evidence_stop_char": batch_char_len,
                               "source_name": source_fn,
                               "page_num": page_num,
+                              "doc_id": doc_id,
+                              "block_id": block_id,
                               }
 
                 batch_metadata.append(new_source)
@@ -1322,6 +1561,8 @@ class Sources:
                               "evidence_stop_char": len(samples[x]["text"]),
                               "source_name": source_fn,
                               "page_num": page_num,
+                              "doc_id": doc_id,
+                              "block_id": block_id,
                               }
 
                 batch_metadata = [new_source]
@@ -1362,8 +1603,7 @@ class Sources:
 
     def chunk_large_sample(self, sample):
 
-        #   if there is a very large single sample, which is bigger than the context window,
-        #   then, break up into smaller chunks
+        """ If single sample bigger than the context window, then break up into smaller chunks """
 
         chunks = []
         max_size = self.prompt.context_window_size
@@ -1394,7 +1634,61 @@ class Sources:
 
 
 class QualityCheck:
+    """Implements the validation between the output of the LLM and the context used to generate the response,
+    which is used by the ``Prompt`` class.
 
+    ``QualityCheck`` allows for the comparison of LLM generated responses with the context that was used to
+    create the response. Concretely, it is quality verifying mechanism used by the ``Prompt`` class.
+    One use case is to verify that reported numbers in the response appear in the context.
+
+    Parameters
+    ----------
+    prompt : object, default=None
+        An object of type ``Prompt``.
+
+    Examples
+    ----------
+    >>> import os
+    >>> from llmware.setup import Setup
+    >>> from llmware.library import Library
+    >>> from llmware.prompts import Prompt
+    >>> library = Library().create_new_library('prompt_with_sources')
+    >>> sample_files_path = Setup().load_sample_files(over_write=False)
+    >>> parsing_output = library.add_files(os.path.join(sample_files_path, "Agreements"))
+    >>> prompt = Prompt().load_model('llmware/bling-1b-0.1')
+    >>> prompt.add_source_document(os.path.join(sample_files_path, "Agreements"), 'Apollo EXECUTIVE EMPLOYMENT AGREEMENT.pdf')
+    >>> result = prompt.prompt_with_source(prompt='What is the base salery amount?', prompt_name='default_with_context')
+    >>> result[0]['llm_response']
+    ' $1,000,000.00'
+    >>> ev_numbers = prompter.evidence_check_numbers(result)
+    >>> ev_numbers[0].keys()
+    dict_keys(['llm_response', 'prompt', 'evidence', 'instruction', 'model',
+               'usage', 'time_stamp', 'calling_app_ID', 'rating', 'account_name',
+               'prompt_id', 'batch_id', 'evidence_metadata', 'biblio', 'event_type',
+               'human_feedback', 'human_assessed_accuracy',
+               'fact_check'])
+    >>> ev_numbers[0]['fact_check']
+    [{'fact': 'detail.', 'status': 'Not Confirmed', 'text': '', 'page_num': '', 'source': ''}]
+    >>> ev_sources = prompter.evidence_check_sources(result)
+    >>> ev_sources[0].keys()
+    dict_keys(['llm_response', 'prompt', 'evidence', 'instruction', 'model',
+               'usage', 'time_stamp', 'calling_app_ID', 'rating', 'account_name',
+               'prompt_id', 'batch_id', 'evidence_metadata', 'biblio', 'event_type',
+               'human_feedback', 'human_assessed_accuracy',
+               'fact_check', 'source_review'])
+    >>> ev_sources[0]['source_review']
+    []
+    >>> ev_stats = prompter.evidence_comparison_stats(result)
+    >>> ev_stats[0].keys()
+    dict_keys(['llm_response', 'prompt', 'evidence', 'instruction', 'model',
+               'usage', 'time_stamp', 'calling_app_ID', 'rating', 'account_name',
+               'prompt_id', 'batch_id', 'evidence_metadata', 'biblio', 'event_type',
+               'human_feedback', 'human_assessed_accuracy', 'fact_check', 'source_review', 'comparison_stats'])
+    >>> ev_stats[0]['comparison_stats']
+    {'percent_display': '0.0%', 'confirmed_words': [],
+     'unconfirmed_words': ['1000000.00'], 'verified_token_match_ratio': 0.0,
+     'key_point_list': [{'key_point': ' $1,000,000.00', 'entry': 0, 'verified_match': 0.0}]}
+    """
     def __init__(self, prompt=None):
 
         self.llm_response = None
@@ -1414,6 +1708,8 @@ class QualityCheck:
 
     def review (self, response_dict, add_markup=False, review_numbers=True, comparison_stats=True,
                 source_review=True, instruction=None):
+
+        """ Input as list of response dictionaries, and output is response dictionaries enriched with review keys. """
 
         self.llm_response = response_dict["llm_response"]
         self.evidence= response_dict["evidence"]
@@ -1437,6 +1733,9 @@ class QualityCheck:
         return self
 
     def fact_checker_numbers (self, response_dict):
+
+        """ Utility function to compare and match number values in llm_response with input source materials.  In most
+        cases, this function should be accessed through the prompt evidence methods rather than calling directly. """
 
         ai_gen_output = response_dict["llm_response"]
         evidence = response_dict["evidence"]
@@ -1654,6 +1953,9 @@ class QualityCheck:
 
     def source_reviewer (self, response_dict):
 
+        """ Utility function to compare and match llm_response with input source materials.  In most
+        cases, this function should be accessed through the prompt evidence methods rather than calling directly. """
+
         ai_tmp_output = response_dict["llm_response"]
         evidence_batch = response_dict["evidence"]
         evidence_metadata = response_dict["evidence_metadata"]
@@ -1712,7 +2014,7 @@ class QualityCheck:
 
             # min threshold to count as source -> % of total or absolute # of matching tokens
             if match_score > min_th or len(ev_match_tokens) > min_match_count:
-                matching_evidence_score.append([match_score, x, ev_match_tokens, evidence_tokens_tmp, evidence_metadata[x]["page_num"], evidence_metadata[x]["source_name"]])
+                matching_evidence_score.append([match_score, x, ev_match_tokens, evidence_tokens_tmp, evidence_metadata[x]["page_num"], evidence_metadata[x]["source_name"], evidence_metadata[x]["doc_id"], evidence_metadata[x]["block_id"]])
 
         mes = sorted(matching_evidence_score, key=lambda x: x[0], reverse=True)
 
@@ -1728,6 +2030,8 @@ class QualityCheck:
 
             page_num = mes[m][4]
             source_name = mes[m][5]
+            doc_id = mes[m][6]
+            block_id = mes[m][7]
             
             # text_snippet = "Page {}- ... ".format(str(page_num))
             text_snippet = ""
@@ -1755,7 +2059,7 @@ class QualityCheck:
 
                 # new_output = {"text": text_snippet, "match_score": mes[m][0],"source": evidence_metadata[mes[m][1]]}
                 new_output = {"text": text_snippet, "match_score": mes[m][0], "source": source_name,
-                              "page_num": page_num}
+                              "page_num": page_num, "doc_id": doc_id, "block_id": block_id}
 
                 sources_output.append(new_output)
 
@@ -1765,12 +2069,14 @@ class QualityCheck:
 
         return sources_output
 
-    # enhanced token comparison
-    #   --applies different rules by instruction, e.g., yes-no exclude
-    #   --if number in output, looks to handle 'word numbers' + float value comparison
-    #   --if multiple points in output, will run comparison separately against each "key point"
-
     def token_comparison (self, response_dict):
+
+        """ Utility function to perform token-level comparison in llm_response with input source materials.  In most
+        cases, this function should be accessed through the prompt evidence methods rather than calling directly. """
+
+        #   --applies different rules by instruction, e.g., yes-no exclude
+        #   --if number in output, looks to handle 'word numbers' + float value comparison
+        #   --if multiple points in output, will run comparison separately against each "key point"
 
         ai_output_text = response_dict["llm_response"]
         evidence_batch = response_dict["evidence"]
@@ -1896,9 +2202,10 @@ class QualityCheck:
 
     def classify_not_found_parse_llm_response(self, response_dict):
 
-        #   Simple, but reasonably accurate way to classify as "not found" - especially with "not found" instructions
-        #   --(1) most models will follow the "not found" instruction and this will be the start of the response
-        #   --(2) if a model gets confused and does not provide any substantive response, then this will get flagged too
+        """Simple, but reasonably accurate way to classify as "not found" - especially with "not found" instructions
+        --(1) most models will follow the "not found" instruction and this will be the start of the response
+        --(2) if a model gets confused and does not provide any substantive response, then this will get flagged too
+        """
 
         # minimal cleaning of response output
         llm_response = response_dict["llm_response"]
@@ -1914,13 +2221,13 @@ class QualityCheck:
 
         return False
 
-    # alternative to calling the model to classify - may be more reliable
     def classify_not_found_evidence_match (self, response_dict, verified_token_match_threshold=0.25):
 
-        #   Objective of this method is to classify a LLM response as "not found"
-        #   --this is a key requirement of 'evidence-based' retrieval augmented generation
-        #   Note on output:     "True" - indicates that classification of 'Not Found'
-        #                       "False" - indicates not 'Not Found' - in other words, use as a valid response
+        """ Objective of this method is to classify a LLM response as "not found"
+            --this is a key requirement of 'evidence-based' retrieval augmented generation
+            Note on output:     "True" - indicates that classification of 'Not Found'
+                                "False" - indicates not 'Not Found' - in other words, use as a valid response
+        """
 
         if "comparison_stats" not in response_dict:
             comparison_stats = self.token_comparison(response_dict)
@@ -1947,6 +2254,9 @@ class QualityCheck:
 
     def classify_not_found_ask_the_model(self, response_dict, selected_model_name=None, model_api_key=None):
 
+        """ Experimental method to 'ask the model' to classify its own response - some models very effective
+        at doing this - others perform poorly - please handle with care. """
+
         if not selected_model_name:
             selected_model_name = self.prompt.llm_name
             model_api_key = self.prompt.llm_model_api_key
@@ -1972,9 +2282,38 @@ class QualityCheck:
 
 
 class HumanInTheLoop:
+    """Implements the human reviewing features, which are used by the ``Prompt`` class.
 
-    # add user ratings to queries and analysis + package for 'human-in-the-loop' review
+    ``HumanInTheLoop`` provides utilities to extract prompt history states for secondary level review.
+    Currently, this includes sending an interaction to a human for review, modifying the response of
+    the model, and adding user ratings to an interaction.
 
+    Parameters
+    ----------
+    prompt : object
+        An object of type ``Prompt``.
+
+    prompt_id_list : list, default=None
+        A list of prompt ids.
+
+    Examples
+    ----------
+    >>> import os
+    >>> from llmware.setup import Setup
+    >>> from llmware.library import Library
+    >>> from llmware.prompts import Prompt, HumanInTheLoop
+    >>> library = Library().create_new_library('prompt_with_sources')
+    >>> sample_files_path = Setup().load_sample_files(over_write=False)
+    >>> parsing_output = library.add_files(os.path.join(sample_files_path, "Agreements"))
+    >>> prompt = Prompt().load_model('llmware/bling-1b-0.1')
+    >>> prompt.add_source_document(os.path.join(sample_files_path, "Agreements"), 'Apollo EXECUTIVE EMPLOYMENT AGREEMENT.pdf')
+    >>> result = prompt.prompt_with_source(prompt='What is the base salery amount?', prompt_name='default_with_context')
+    >>> csv_metadata = HumanInTheLoop(prompt).export_current_interaction_to_csv()
+    >>> csv_metadata
+    {'report_name': 'interaction_report_Sun Mar 10 17:16:01 2024.csv',
+     'report_fp': '/home/user/llmware_data/prompt_history/interaction_report_Sun Mar 10 17:16:01 2024.csv',
+     'results': 1}
+    """
     def __init__(self, prompt, prompt_id_list=None):
 
         self.prompt= prompt
@@ -1982,7 +2321,7 @@ class HumanInTheLoop:
 
     def export_interaction_to_csv(self, prompt_id_list=None, output_path=None, report_name=None):
 
-        # this method will take a list of one or more prompt_ids and dump to csv for user to review and edit
+        """Input a list of one or more prompt_ids and dump to csv for user to review and edit """
 
         output = PromptState(self.prompt).generate_interaction_report(prompt_id_list,
                                                                       output_path=output_path,
@@ -1992,20 +2331,24 @@ class HumanInTheLoop:
 
     def export_current_interaction_to_csv(self, output_path=None, report_name=None):
 
-        # this method will take the current interaction state and dump to csv ffor user to review and edit
+        """ this method will take the current interaction state and dump to csv for user to review and edit """
 
         output = PromptState(self.prompt).generate_interaction_report_current_state(output_path=output_path,
                                                                                     report_name=report_name)
 
         return output
 
-    # TODO-WIP
     def import_updated_csv(self, fp, fn, prompt_id):
 
+        """ Not implemented yet. """
+
         # allows corrections to be uploaded by csv spreadsheet and corrections made in the history
+
         return 0
 
     def add_or_update_human_rating (self, prompt_id, rating_dict):
+
+        """ Adds and updates human rating and feedback to a selected response dictionary. """
 
         rating = -1
         accuracy = ""
@@ -2028,8 +2371,9 @@ class HumanInTheLoop:
 
         return 0
 
-    # new method to allow user to edit/update an llm_response record
     def update_llm_response_record(self,prompt_id, update_dict,keep_change_log=True):
+
+        """ Provide more general update, including corrections, to a response dictionary 'post-human-review.' """
 
         # as default option, preserve the current values in a change_log list
         #   --over time, we can evaluate whether to capture more metadata about the change, roll-back, etc.

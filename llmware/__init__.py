@@ -12,6 +12,15 @@
 # implied.  See the License for the specific language governing
 # permissions and limitations under the License.
 
-__version__ = '0.1.14'
+"""The llmware package provides tools to build large language model (LLM) applications, this includes
+a custom set of LLMs that are small and open source.
+
+The llmware package aspires to be a middleware in LLM applications. In other words, it provides the
+infrastructure between the components, such as the models, the prompts, the text databases, and
+the vector databases.
+"""
+
+
+__version__ = '0.2.5'
 __author__ = 'llmware'
 __license__ = 'Apache 2.0 License'

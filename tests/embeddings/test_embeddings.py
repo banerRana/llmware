@@ -11,6 +11,7 @@ from llmware.setup import Setup
 from llmware.status import Status
 from llmware.configs import LLMWareConfig
 from llmware.resources import CloudBucketManager
+from tests.embeddings.utils import qdrant_installed
 
 def test_unsupported_embedding_db():
     embedding_db = "milvusXYZ"  # Bad Embedding DB Name
@@ -27,11 +28,41 @@ def test_milvus_embedding_and_query():
     assert len(results) > 0
     library.delete_library(confirm_delete=True)
 
+def test_neo4j_embedding_and_query():
+    sample_files_path = Setup().load_sample_files()
+    library = Library().create_new_library("test_embedding_neo4j")
+    library.add_files(os.path.join(sample_files_path,"SmallLibrary"))
+    results = generic_embedding_and_query(library, "neo4j")
+    assert len(results) > 0
+    library.delete_library(confirm_delete=True)
+
+# TODO: add test for permanent mode.
+# TODO: add test for client/server mode with password auth.
+# TODO: add test for client/server mode with token auth.
+# TODO: investigate why test failes when library name is set to test_embedding_chromadb
+def test_chromadb_embedding_and_query():
+    sample_files_path = Setup().load_sample_files()
+    library = Library().create_new_library("test_embedding_neo4j") # if this is set to chromadb, it fails
+    library.add_files(os.path.join(sample_files_path,"SmallLibrary"))
+    results = generic_embedding_and_query(library, "chromadb")
+    assert len(results) > 0
+    library.delete_library(confirm_delete=True)
+
 def test_faiss_embedding_and_query():
     sample_files_path = Setup().load_sample_files()
     library = Library().create_new_library("test_embedding_faiss")
     library.add_files(os.path.join(sample_files_path,"SmallLibrary"))
     results = generic_embedding_and_query(library, "faiss")
+    assert len(results) > 0
+    library.delete_library(confirm_delete=True)
+
+@pytest.mark.skipif(not qdrant_installed(), reason="Qdrant client is not installed")
+def test_qdrant_embedding_and_query():
+    os.environ["USER_MANAGED_QDRANT_LOCATION"] = ":memory:"
+    sample_files_path = Setup().load_sample_files()
+    library = Library().create_new_library("test_embedding_qdrant")
+    library.add_files(os.path.join(sample_files_path,"SmallLibrary"))
+    results = generic_embedding_and_query(library, "qdrant")
     assert len(results) > 0
     library.delete_library(confirm_delete=True)
 

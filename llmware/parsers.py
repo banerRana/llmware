@@ -1,4 +1,3 @@
-
 # Copyright 2023 llmware
 
 # Licensed under the Apache License, Version 2.0 (the "License"); you
@@ -12,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 # implied.  See the License for the specific language governing
 # permissions and limitations under the License.
+"""The parsers module implements all parsers, i.e. all conversions fom a modality to bloacks in a database.
+
+The module currently implements parsers for websites, images, voices, texts, wikis, and dialogs.
+"""
 
 
 import time
@@ -19,64 +22,48 @@ import json
 import re
 from werkzeug.utils import secure_filename
 import os
-import numpy as np
 from zipfile import ZipFile, ZIP_DEFLATED
-import ssl
 import shutil
-from collections import Counter
 import requests
-from bs4 import BeautifulSoup
 from urllib.request import urlopen, Request
 
-import pytesseract
-from pytesseract.pytesseract import TesseractNotFoundError
-from pdf2image import convert_from_path
-from pdf2image.exceptions import PDFInfoNotInstalledError
-import struct
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    pass
+
+try:
+    import pytesseract
+    from pytesseract.pytesseract import TesseractNotFoundError
+except ImportError:
+    pass
+
+try:
+    from pdf2image import convert_from_path
+    from pdf2image.exceptions import PDFInfoNotInstalledError
+except ImportError:
+    pass
+
 import logging
 import random
 from ctypes import *
 import platform
-import sysconfig
 
-from llmware.configs import LLMWareConfig
+from llmware.configs import LLMWareConfig, LLMWareTableSchema
 from llmware.util import Utilities, WikiKnowledgeBase, TextChunker
-from llmware.resources import CollectionRetrieval, CollectionWriter, check_db_uri, ParserState
-from llmware.exceptions import DependencyNotInstalledException, FilePathDoesNotExistException, OCRDependenciesNotFoundException
+from llmware.resources import CollectionRetrieval, CollectionWriter, ParserState
 
-# setting important when testing locally - should be removed in production
-# ssl._create_default_https_context = ssl._create_unverified_context
+from llmware.exceptions import DependencyNotInstalledException, FilePathDoesNotExistException, \
+    OCRDependenciesNotFoundException, LLMWareException
 
-# Best ways we've found to detect machine architecture
-if platform.system() == "Windows":
-    system = "windows"
-    machine = "x86_64"
-    file_ext = ".dll"
-else:
-    system = platform.system().lower()
-    machine = os.uname().machine.lower()
-    file_ext = ".so"
-
-# Default to known architectures if we encounter an unknown one
-if system == 'darwin' and machine not in ['arm64','x86_64']:
-    machine = 'arm64'
-if system == 'linux' and machine not in ['aarch64','x86_64']:
-    machine = 'x86_64'
-
-# Constuct the path to a specific lib folder.  Eg. .../llmware/lib/darwin/x86_64
-machine_dependent_lib_path = os.path.join(LLMWareConfig.get_config("shared_lib_path"), system, machine)
-
-_path_office = os.path.join(machine_dependent_lib_path, "llmware", "liboffice_llmware" + file_ext)
-_path_pdf    = os.path.join(machine_dependent_lib_path, "llmware", "libpdf_llmware" + file_ext)
-_path_graph  = os.path.join(machine_dependent_lib_path, "llmware", "libgraph_llmware" + file_ext)
-
-_mod = cdll.LoadLibrary(_path_office)
-_mod_pdf = cdll.LoadLibrary(_path_pdf)
-_mod_initialize = cdll.LoadLibrary(_path_graph)
 
 class Parser:
 
     def __init__(self, library=None, account_name="llmware", parse_to_db=False, file_counter=1):
+
+        """ Main class for handling parsing, e.g., conversion of documents and other unstructured files
+        into indexed text collection of 'blocks' in database.   For most use cases, Parser does not need
+        to be invoked directly - as Library and Prompt are more natural client interfaces. """
 
         # check for llmware path & create if not already set up
         if not os.path.exists(LLMWareConfig.get_llmware_path()):
@@ -131,12 +118,15 @@ class Parser:
             self.parser_image_folder = library.image_path
 
             # sets parse_to_db == True only if (a) library passed in constructor, and (b) collection db found
-            if check_db_uri(timeout_secs=3):
+
+            # check if collection datastore is connected
+            if CollectionRetrieval(self.library_name,account_name=self.account_name).test_connection():
+                # if not check_db_uri(timeout_secs=3):
                 self.parse_to_db = True
             else:
                 logging.warning("warning: Parser not able to connect to document store collection database"
                                 "at uri - %s - will write parsing output to a parsing file.",
-                                LLMWareConfig().get_config("collection_db_uri"))
+                                LLMWareConfig.get_db_uri_string())
 
                 self.parse_to_db = False
         else:
@@ -145,9 +135,10 @@ class Parser:
             self.parser_image_folder = self.parser_tmp_folder
 
         # used to pass to the C parsers in pdf/office parsing paths
-        self.collection_path = LLMWareConfig.get_config("collection_db_uri")
-        self.collection_db_username = LLMWareConfig.get_config("collection_db_username")
-        self.collection_db_password = LLMWareConfig.get_config("collection_db_password")
+        self.collection_path = LLMWareConfig.get_db_uri_string()
+        self.collection_db_configs = LLMWareConfig.get_db_configs()
+        self.collection_db_username = LLMWareConfig.get_db_user_name()
+        self.collection_db_password = LLMWareConfig.get_db_pw()
 
         # 'active' output state tracker
         self.parser_output = []
@@ -171,15 +162,40 @@ class Parser:
         self.supported_parser_types = ["pdf", "office", "text", "voice", "dialog", "web", "image",
                                        "pdf_by_ocr"]
 
+        self.schema = LLMWareTableSchema.get_parser_table_schema()
+
+        if self.parse_to_db:
+            # if table does not exist, then create
+            if CollectionWriter("parser_events", account_name=self.account_name).check_if_table_build_required():
+
+                # create "status" table
+                CollectionWriter("parser_events", account_name=self.account_name).create_table("parser_events",
+                                                                                               self.schema)
+
+            # parsers write status update - confirm that status tables created
+            if CollectionWriter("status", account_name=self.account_name).check_if_table_build_required():
+
+                CollectionWriter("status",
+                                 account_name=self.account_name).create_table("status",
+                                                                              LLMWareTableSchema.get_status_schema())
+
     def clear_state(self):
+
+        """Clears parser state. """
+
         self.parser_output = []
         return self
 
     def save_state(self):
+
+        """ Saves parser state. """
+
         ParserState().save_parser_output(self.parser_job_id, self.parser_output)
         return self
 
     def _setup_workspace(self, local_work_path):
+
+        """ Internal method to setup workspace for parsing job. """
 
         # set up local workspace folders
         if not local_work_path:
@@ -240,6 +256,8 @@ class Parser:
 
     def _collator(self, input_folder_path, dupe_check=False):
 
+        """ Internal utility method to prepare and organize files for parsing. """
+
         # run comparison for existing files if dupe_check set True
         # default case - no checking for dupes
         existing_files = []
@@ -263,47 +281,53 @@ class Parser:
         files_to_be_processed = []
         duplicate_files = []
 
+
+        if dupe_check:
+            # we get a reduced list of input_file_names if in existing_files is files we try to process
+            duplicate_files_tmp = list(set(input_file_names) - set(existing_files))
+            # the duplicates are those that where not in duplicate_files_tmp so we take out the tmp from the input_file_names
+            # what's left is the duplicates
+            duplicate_files =  list(set(input_file_names) - set(duplicate_files_tmp))
+            # the counter is the length of the array
+            dup_counter = len(duplicate_files)
+            # We are done with this and we don't need to n times loop as before
+            # we set the imput_file_names to be the reduced list to not to process dupe files
+            input_file_names = duplicate_files_tmp
+
+
+
+
         for filename in input_file_names:
 
             filetype = filename.split(".")[-1]
 
-            go_ahead = True
+            files_to_be_processed.append(filename)
 
-            if dupe_check:
-                if filename in existing_files:
-                    go_ahead= False
-                    dup_counter += 1
-                    duplicate_files.append(filename)
+            # copy file into specific channel for targeted parser
 
-            if go_ahead:
+            if filetype.lower() in self.office_types:
+                shutil.copy(os.path.join(input_folder_path,filename), os.path.join(self.office_work_folder,filename))
+                office_found += 1
 
-                files_to_be_processed.append(filename)
+            if filetype.lower() in self.pdf_types:
+                shutil.copy(os.path.join(input_folder_path,filename), os.path.join(self.pdf_work_folder, filename))
+                pdf_found += 1
 
-                # copy file into specific channel for targeted parser
+            if filetype.lower() in self.text_types:
+                shutil.copy(os.path.join(input_folder_path,filename), os.path.join(self.text_work_folder,filename))
+                text_found += 1
 
-                if filetype.lower() in self.office_types:
-                    shutil.copy(os.path.join(input_folder_path,filename), os.path.join(self.office_work_folder,filename))
-                    office_found += 1
+            if filetype.lower() in self.ocr_types:
+                shutil.copy(os.path.join(input_folder_path,filename), os.path.join(self.ocr_work_folder,filename))
+                ocr_found += 1
 
-                if filetype.lower() in self.pdf_types:
-                    shutil.copy(os.path.join(input_folder_path,filename), os.path.join(self.pdf_work_folder, filename))
-                    pdf_found += 1
+            if filetype.lower() in self.voice_types:
+                shutil.copy(os.path.join(input_folder_path,filename), os.path.join(self.voice_work_folder,filename))
+                voice_found += 1
 
-                if filetype.lower() in self.text_types:
-                    shutil.copy(os.path.join(input_folder_path,filename), os.path.join(self.text_work_folder,filename))
-                    text_found += 1
-
-                if filetype.lower() in self.ocr_types:
-                    shutil.copy(os.path.join(input_folder_path,filename), os.path.join(self.ocr_work_folder,filename))
-                    ocr_found += 1
-
-                if filetype.lower() in self.voice_types:
-                    shutil.copy(os.path.join(input_folder_path,filename), os.path.join(self.voice_work_folder,filename))
-                    voice_found += 1
-
-                if filetype.lower() in self.zip_types:
-                    shutil.copy(os.path.join(input_folder_path,filename), os.path.join(self.zip_work_folder,filename))
-                    zip_found += 1
+            if filetype.lower() in self.zip_types:
+                shutil.copy(os.path.join(input_folder_path,filename), os.path.join(self.zip_work_folder,filename))
+                zip_found += 1
 
         logging.info("update:  Duplicate files (skipped): %s ", dup_counter)
         logging.info("update:  Total uploaded: %s ", len(input_file_names))
@@ -315,11 +339,11 @@ class Parser:
             #       --inside zip_extract_handler- will update counters
 
             zip_work_order = self.zip_extract_handler()
-            pdf_found += zip_work_order["pdf_found"]
-            office_found += zip_work_order["office_found"]
-            text_found += zip_work_order["text_found"]
-            voice_found += zip_work_order["voice_found"]
-            ocr_found += zip_work_order["ocr_found"]
+            pdf_found += zip_work_order["pdf"]
+            office_found += zip_work_order["office"]
+            text_found += zip_work_order["text"]
+            voice_found += zip_work_order["voice"]
+            ocr_found += zip_work_order["ocr"]
 
         work_order = {"pdf": pdf_found,
                       "office": office_found,
@@ -332,6 +356,12 @@ class Parser:
         return work_order
 
     def ingest (self, input_folder_path, dupe_check=True):
+
+        """ Main method for large-scale parsing. Takes only a single input which is the local input folder path
+         containing the files to be parsed.
+
+         Optional dupe_check parameter set to True to restrict ingesting a file with the same name as a file
+         already in the library. """
 
         # input_folder_path = where the input files are located
 
@@ -387,6 +417,9 @@ class Parser:
 
     def ingest_to_json(self, input_folder_path):
 
+        """ Mirrors the main ingest method but intended for writing parsing output directly to json when
+        'writing_to_db' = False. """
+
         # prepares workspace for individual parsers
         self._setup_workspace(self.parser_tmp_folder)
 
@@ -426,6 +459,8 @@ class Parser:
 
     def parse_by_type(self, parser_type, input_folder_path, url=None):
 
+        """ Parse files by content type. """
+
         output = None
 
         if parser_type in self.supported_parser_types:
@@ -453,8 +488,9 @@ class Parser:
 
         return output
 
-    # designed to take any input zip files and iteratively unzip and push files to specific fp
     def zip_extract_handler(self):
+
+        """ Unzips and extracts files from zip archive -and iteratively push files to specific file path. """
 
         # tracker for files found inside the zip
         pdf_found = 0
@@ -532,8 +568,10 @@ class Parser:
 
         return work_order
 
-    # new method - picks up .txt file from Office or PDF parser and converts to list of dictionaries for insertion in DB
     def convert_parsing_txt_file_to_json(self, file_path=None, fn="pdf_internal_test0.txt"):
+
+        """ Utility method that picks up a .txt file output from Office or PDF parser and converts to a list
+        of dictionaries for insertion in an external DB. """
 
         default_keys = ["block_ID", "doc_ID", "content_type", "file_type", "master_index", "master_index2",
                         "coords_x", "coords_y", "coords_cx", "coords_cy", "author_or_speaker", "modified_date",
@@ -547,7 +585,7 @@ class Parser:
 
         # test script for parsing txt file
         try:
-            output_file = open(os.path.join(file_path, fn), "r", encoding="utf-8").read()
+            output_file = open(os.path.join(file_path, fn), "r", encoding="utf-8-sig",errors="ignore").read()
 
         except Exception as e:
             print (e)
@@ -597,8 +635,192 @@ class Parser:
 
         return output_list
 
-    # this is new parser endpoint designed for llmware - aligns to latest native branch
     def parse_pdf (self, fp, write_to_db=True, save_history=True, image_save=1):
+
+        """ Main PDF parser method - wraps ctypes interface to call PDF parser. """
+
+        output = []
+
+        write_to_filename = "pdf_parse_output_0.txt"
+
+        #   must have three conditions in place - (a) user selects, (b) ping successfully, and (c) library loaded
+        if write_to_db and self.parse_to_db and self.library:
+            write_to_db_on = 1
+            unique_doc_num = -1
+        else:
+            write_to_db_on = 0
+            unique_doc_num = int(self.file_counter)
+
+        #   warning to user that no library loaded in Parser constructor
+        if write_to_db and not self.library:
+            logging.warning("warning: Parser().parse_pdf - request to write to database but no library loaded "
+                            "in Parser constructor.   Will write parsing output to file and will place the "
+                            "file in /parser_history path.")
+
+        #   warning to user that database connection not found
+        if write_to_db and not self.parse_to_db:
+            logging.error("warning: Parser().parse_pdf - could not connect to database at %s.  Will write "
+                          "parsing output to file and will place the file in /parser_history path.",
+                          self.collection_path)
+
+        #   function declaration for .add_pdf_main_llmware
+        # char * input_account_name,
+        # char * input_library_name,
+        # char * input_fp,
+        # char * db,
+        # char * db_uri_string,
+        # char * db_name,
+        # char * db_user_name,
+        # char * db_pw,
+        # char * input_images_fp,
+        # int input_debug_mode,
+        # int input_image_save_mode,
+        # int write_to_db_on,
+        # char * write_to_filename,
+        # int user_blok_size,
+        # int unique_doc_num,
+        # int status_manager_on,
+        # int status_manager_increment,
+        # char * status_job_id
+
+        #   if any issue loading module, will be captured at .get_module_pdf_parser()
+        _mod_pdf = Utilities().get_module_pdf_parser()
+
+        # pdf_handler = _mod_pdf.add_pdf_main_customize_parallel
+        pdf_handler = _mod_pdf.add_pdf_main_llmware_config
+
+        pdf_handler.argtypes = (c_char_p, c_char_p, c_char_p, c_char_p, c_char_p, c_char_p, c_char_p, c_char_p,
+                                c_char_p, c_int, c_int, c_int, c_char_p, c_int,c_int,c_int,c_int,c_char_p)
+
+        pdf_handler.restypes = c_int
+
+        # prepare all of the inputs to invoke the c library
+
+        t0 = time.time()
+
+        # config options pulled from the Library object
+        account_name = create_string_buffer(self.account_name.encode('ascii', 'ignore'))
+        library_name = create_string_buffer(self.library_name.encode('ascii', 'ignore'))
+
+        # image_fp = self.library.image_path
+        image_fp = self.parser_image_folder
+
+        if not image_fp.endswith(os.sep):
+            image_fp += os.sep
+
+        image_fp_c = create_string_buffer(image_fp.encode('ascii', 'ignore'))
+
+        input_collection_db_path = LLMWareConfig().get_db_uri_string()
+
+        collection_db_path_c = create_string_buffer(input_collection_db_path.encode('ascii', 'ignore'))
+
+        #   fp = passed as parameter -> this is the input file path folder containing the .PDF docs to be parsed
+        if not fp.endswith(os.sep):
+            fp += os.sep
+
+        fp_c = create_string_buffer(fp.encode('ascii', 'ignore'))
+
+        # debug_mode global parameter
+        #   "on" = 1
+        #   "file name only" = 2
+        #   "deep debug" = 3
+        #   "off" = 0 & all other values
+
+        # pull debug mode 'verbosity' levels from LLMWareConfig
+        debug_mode = LLMWareConfig.get_config("debug_mode")
+
+        supported_options = [0, 1, 2, 3]
+
+        if debug_mode not in supported_options:
+            debug_mode = 0
+
+        input_debug_mode = c_int(debug_mode)  # default - 0 = "off"
+        input_image_save_mode = c_int(image_save)  # default - 1 = "on" | use 0 = "off" in production
+
+        write_to_db_on_c = c_int(write_to_db_on)
+        write_to_filename_c = create_string_buffer(write_to_filename.encode('ascii', 'ignore'))
+
+        # pull target block size from library parameters
+        user_block_size = c_int(self.block_size_target_characters)  # standard 400-600
+
+        # unique_doc_num -> if <0: interpret as "OFF" ... if >=0 then use and increment doc_id directly
+        # unique_doc_num = -1
+        unique_doc_num_c = c_int(unique_doc_num)
+
+        # db credentials
+        db_user_name = self.collection_db_username
+        db_user_name_c = create_string_buffer(db_user_name.encode('ascii', 'ignore'))
+
+        db_pw = self.collection_db_password
+        db_pw_c = create_string_buffer(db_pw.encode('ascii', 'ignore'))
+
+        db = LLMWareConfig.get_config("collection_db")
+
+        db = create_string_buffer(db.encode('ascii','ignore'))
+        db_name = account_name
+
+        status_manager_on = c_int(1)
+        status_manager_increment = c_int(10)
+        status_job_id = create_string_buffer("1".encode('ascii','ignore'))
+
+        #
+        #                   * main call to pdf library *
+        #
+
+        logging.info("update: start parsing of PDF Documents...")
+
+        #   function declaration for .add_pdf_main_llmware
+        # char * input_account_name,
+        # char * input_library_name,
+        # char * input_fp,
+        # char * db,
+        # char * db_uri_string,
+        # char * db_name,
+        # char * db_user_name,
+        # char * db_pw,
+        # char * input_images_fp,
+        # int input_debug_mode,
+        # int input_image_save_mode,
+        # int write_to_db_on,
+        # char * write_to_filename,
+        # int user_blok_size,
+        # int unique_doc_num,
+        # int status_manager_on,
+        # int status_manager_increment,
+        # char * status_job_id
+
+        pages_created = pdf_handler(account_name, library_name, fp_c, db, collection_db_path_c, db_name,
+                                    db_user_name_c, db_pw_c,
+                                    image_fp_c,
+                                    input_debug_mode, input_image_save_mode, write_to_db_on_c,
+                                    write_to_filename_c, user_block_size, unique_doc_num_c,
+                                    status_manager_on, status_manager_increment, status_job_id)
+
+        logging.info("update:  completed parsing of pdf documents - time taken: %s ", time.time() - t0)
+
+        if write_to_db_on == 0:
+            # package up results in Parser State
+            parser_output = self.convert_parsing_txt_file_to_json(self.parser_image_folder, write_to_filename)
+            if len(parser_output) > 0:
+                last_entry = parser_output[-1]
+                last_doc_id = last_entry["doc_ID"]
+
+                self.file_counter = int(last_doc_id)
+
+                logging.info("update: adding new entries to parser output state - %s", len(parser_output))
+
+                self.parser_output += parser_output
+                output += parser_output
+
+            if save_history:
+                ParserState().save_parser_output(self.parser_job_id, parser_output)
+
+        return output
+
+    def parse_pdf_deprecated (self, fp, write_to_db=True, save_history=True, image_save=1):
+
+        """ Deprecated - this is the pdf entry point for PDF binaries packaged up to llmware-0.1.14 -- replaced
+        starting with llmware-0.2.0 """
 
         output = []
 
@@ -622,7 +844,7 @@ class Parser:
         if write_to_db and not self.parse_to_db:
             logging.error("warning: Parser().parse_pdf - could not connect to database at %s.  Will write "
                           "parsing output to file and will place the file in /parser_history path.",
-                          LLMWareConfig.get_config("collection_db_uri"))
+                          LLMWareConfig().get_db_uri_string())
 
         #   function declaration for .add_pdf_main_llmware
         #       char * input_account_name,
@@ -638,6 +860,9 @@ class Parser:
         #       int unique_doc_num,
         #       char * db_user_name,
         #       char * db_pw
+
+        #   if any issue loading module, will be captured at .get_module_pdf_parser()
+        _mod_pdf = Utilities().get_module_pdf_parser()
 
         # pdf_handler = _mod_pdf.add_pdf_main_customize_parallel
         pdf_handler = _mod_pdf.add_pdf_main_llmware
@@ -743,8 +968,6 @@ class Parser:
                 last_entry = parser_output[-1]
                 last_doc_id = last_entry["doc_ID"]
 
-                # print("update: last doc_ID = ", last_doc_id)
-
                 self.file_counter = int(last_doc_id)
 
                 logging.info("update: adding new entries to parser output state - %s", len(parser_output))
@@ -757,8 +980,10 @@ class Parser:
 
         return output
 
-    # new office parser entry point for llmware specifically
-    def parse_office (self, input_fp, write_to_db=True, save_history=True):
+    def parse_office_deprecated (self, input_fp, write_to_db=True, save_history=True):
+
+        """ Deprecated - this is the office parser entry point for Office parser binaries packaged up to
+        llmware-0.1.14 -- replaced starting with llmware-0.2.0 """
 
         output = []
 
@@ -783,7 +1008,7 @@ class Parser:
         if write_to_db and not self.parse_to_db:
             logging.error("error: Parser().parse_office - could not connect to database at %s.  Will write "
                           "parsing output to file and will place the file in Library /images path.",
-                          LLMWareConfig.get_config("collection_db_uri"))
+                          self.collection_path)
 
         # designed for bulk upload of office parse into library structure
 
@@ -814,6 +1039,9 @@ class Parser:
                 os.chmod(os.path.join(workspace_fp, str(z)), 0o777)
 
         # end -initialize workspace
+
+        #   if any issue loading module, will be captured at .get_module_office_parser()
+        _mod = Utilities().get_module_office_parser()
 
         # new endpoint for llmware
         main_handler = _mod.add_files_main_llmware
@@ -931,11 +1159,231 @@ class Parser:
 
         return output
 
-    def parse_text(self, input_fp, write_to_db=True, save_history=True):
+    def parse_office(self, input_fp, write_to_db=True, save_history=True):
+
+        """ Primary method interface into Office parser with more db configuration options - implemented starting
+        with llmware-0.2.0 """
 
         output = []
 
-        #   must have three conditions in place - (a) user selects, (b) ping successfully, and (c) library loadedd
+        # used internally by parser to capture text
+        write_to_filename = "office_parser_output_0.txt"
+
+        #   must have three conditions in place - (a) user selects, (b) ping successfully, and (c) library loaded
+        if write_to_db and self.parse_to_db and self.library:
+            write_to_db_on = 1
+            unique_doc_num = -1
+        else:
+            write_to_db_on = 0
+            unique_doc_num = int(self.file_counter)
+
+        #   warning to user that no library loaded in Parser constructor
+        if write_to_db and not self.library:
+            logging.warning("error: Parser().parse_office - request to write to database but no library loaded "
+                            "in Parser constructor.   Will write parsing output to file and will place the "
+                            "file in Parser /parser_history path.")
+
+        #   warning to user that database connection not found
+        if write_to_db and not self.parse_to_db:
+            logging.error("error: Parser().parse_office - could not connect to database at %s.  Will write "
+                          "parsing output to file and will place the file in Library /images path.",
+                          self.collection_path)
+
+        # designed for bulk upload of office parse into library structure
+
+        if not input_fp.endswith(os.sep):
+            input_fp += os.sep
+
+        office_fp = input_fp
+
+        workspace_fp = os.path.join(self.parser_tmp_folder, "office_tmp" + os.sep)
+
+        if not os.path.exists(workspace_fp):
+            os.mkdir(workspace_fp)
+            os.chmod(workspace_fp, 0o777)
+
+        # need to synchronize as config parameter
+
+        # start timing track for parsing job
+        t0 = time.time()
+
+        # only one tmp work folder used currently - can consolidate over time
+        for z in range(0, 5):
+
+            if os.path.exists(os.path.join(workspace_fp, str(z))):
+                shutil.rmtree(os.path.join(workspace_fp, str(z)), ignore_errors=True)
+
+            if not os.path.exists(os.path.join(workspace_fp, str(z))):
+                os.mkdir(os.path.join(workspace_fp, str(z)))
+                os.chmod(os.path.join(workspace_fp, str(z)), 0o777)
+
+        # end -initialize workspace
+
+        #   if any issue loading module, will be captured at .get_module_office_parser()
+        _mod = Utilities().get_module_office_parser()
+
+        # new endpoint for llmware
+        main_handler = _mod.add_files_main_llmware_opt
+
+        """
+        (char * input_account_name,
+         char * input_library_name,
+         char * input_fp,
+         char * workspace_fp,
+
+         char * db,
+         char * db_uri_string,
+         char * db_name,
+         char * db_user_name,
+         char * db_pw,
+
+         char * image_fp,
+         
+         int input_debug_mode,
+         int write_to_db_on,
+         char * write_to_filename,
+         int unique_doc_num,
+         int user_blok_size,
+         int status_manager_on,
+         int status_manager_increment,
+         char * status_job_id)
+        """
+
+        # main_handler = _mod.add_files_main_customize_parallel
+        main_handler.argtypes = (c_char_p, c_char_p, c_char_p, c_char_p, c_char_p,
+                                 c_char_p, c_char_p, c_char_p, c_char_p, c_char_p,
+                                 c_int, c_int, c_char_p, c_int, c_int, c_int, c_int,
+                                 c_char_p)
+
+        main_handler.restype = c_int
+
+        # three inputs - account_name // library_name // fp to web_dir - files to be processed
+        # prep each string:    account_name = create_string_buffer(py_account_str.encode('ascii','ignore'))
+
+        account_name = create_string_buffer(self.account_name.encode('ascii', 'ignore'))
+        library_name = create_string_buffer(self.library_name.encode('ascii', 'ignore'))
+
+        fp_c = create_string_buffer(office_fp.encode('ascii', 'ignore'))
+        workspace_fp_c = create_string_buffer(workspace_fp.encode('ascii', 'ignore'))
+
+        # debug_mode global parameter
+        #   "on" = 1
+        #   "file name only" = 2
+        #   "deep debug" = 3
+        #   "off" = 0 & all other values
+
+        debug_mode = LLMWareConfig.get_config("debug_mode")
+
+        supported_options = [0, 1, 2, 3]
+
+        if debug_mode not in supported_options:
+            debug_mode = 0
+
+        debug_mode_c = c_int(debug_mode)
+
+        # image_fp = self.library.image_path
+
+        image_fp = self.parser_image_folder
+        if not image_fp.endswith(os.sep):
+            image_fp += os.sep
+
+        image_fp_c = create_string_buffer(image_fp.encode('ascii', 'ignore'))
+
+        # *** new *** - get db uri string
+        input_collection_db_path = LLMWareConfig().get_db_uri_string()
+        # print("update: input collection db path - ", input_collection_db_path)
+        collection_db_path_c = create_string_buffer(input_collection_db_path.encode('ascii', 'ignore'))
+        # *** end - new ***
+
+        write_to_db_on_c = c_int(write_to_db_on)
+
+        write_to_fn_c = create_string_buffer(write_to_filename.encode('ascii', 'ignore'))
+
+        # unique_doc_num is key parameter - if <0: will pull from incremental db, if >=0, then will start at this value
+        # unique_doc_num = -1
+        unique_doc_num_c = c_int(unique_doc_num)
+
+        # start new
+
+        # pull target block size from library parameters
+        user_block_size_c = c_int(self.block_size_target_characters)  # standard 400-600
+
+        # db credentials
+        db_user_name = self.collection_db_username
+        db_user_name_c = create_string_buffer(db_user_name.encode('ascii', 'ignore'))
+
+        db_pw = self.collection_db_password
+        db_pw_c = create_string_buffer(db_pw.encode('ascii', 'ignore'))
+
+        db = LLMWareConfig.get_config("collection_db")
+
+        db = create_string_buffer(db.encode('ascii','ignore'))
+        db_name = account_name
+
+        status_manager_on_c = c_int(1)
+        status_manager_increment_c = c_int(10)
+        status_job_id_c = create_string_buffer("1".encode('ascii','ignore'))
+
+        # end - new
+        """
+        (char * input_account_name,
+         char * input_library_name,
+         char * input_fp,
+         char * workspace_fp,
+
+         char * db,
+         char * db_uri_string,
+         char * db_name,
+         char * db_user_name,
+         char * db_pw,
+
+         char * image_fp,
+         int input_debug_mode,
+         int write_to_db_on,
+         char * write_to_filename,
+         int unique_doc_num,
+         int user_blok_size,
+         int status_manager_on,
+         int status_manager_increment,
+         char * status_job_id)
+        """
+
+        # print("update: start parsing of office documents...")
+
+        pages_created = main_handler(account_name, library_name, fp_c, workspace_fp_c,
+                                     db, collection_db_path_c, db_name, db_user_name_c, db_pw_c,
+                                     image_fp_c,
+                                     debug_mode_c, write_to_db_on_c, write_to_fn_c, unique_doc_num_c,
+                                     user_block_size_c, status_manager_on_c, status_manager_increment_c,
+                                     status_job_id_c)
+
+        logging.info("update:  completed parsing of office documents - time taken: %s ", time.time() - t0)
+
+        if write_to_db_on == 0:
+            # package up results in Parser State
+            parser_output = self.convert_parsing_txt_file_to_json(self.parser_image_folder, write_to_filename)
+            if len(parser_output) > 0:
+                last_entry = parser_output[-1]
+                last_doc_id = last_entry["doc_ID"]
+
+                self.file_counter = int(last_doc_id)
+
+                self.parser_output += parser_output
+                output += parser_output
+
+            if save_history:
+                # save parser state
+                ParserState().save_parser_output(self.parser_job_id, parser_output)
+
+        return output
+
+    def parse_text(self, input_fp, write_to_db=True, save_history=True, dupe_check=False,copy_to_library=False):
+
+        """ Main entry point to parser for .txt, .csv, .json and .md files """
+
+        output = []
+
+        #   must have three conditions in place - (a) user selects, (b) ping successfully, and (c) library loaded
         if write_to_db and self.parse_to_db and self.library:
             write_to_db_on = 1
         else:
@@ -951,7 +1399,7 @@ class Parser:
         if write_to_db and not self.parse_to_db:
             logging.error("warning: Parser().parse_text - could not connect to database at %s.  Will write "
                           "parsing output to file and will place the file in /parser_history path.",
-                          LLMWareConfig.get_config("collection_db_uri"))
+                          self.collection_path)
 
         # set counters
         blocks_created = 0
@@ -961,64 +1409,76 @@ class Parser:
 
         for file in os.listdir(input_fp):
 
-            text_output = []
-            # increment and get new doc_id
-            if write_to_db_on == 1:
-                self.library.doc_ID = self.library.get_and_increment_doc_id()
+            # by default, will process all files with text file extensions
+            go_ahead = True
 
-            file_type = file.split(".")[-1]
+            if dupe_check:
 
-            # sub-routing by type of text file to appropriate handler
+                #   basic_library_duplicate_check returns TRUE if it finds the file
+                if self.basic_library_duplicate_check(file):
+                    go_ahead = False
 
-            if file_type.lower() in ["txt", "md"]:
-                # will parse as text
-                text_output = TextParser(self).text_file_handler (input_fp, file)
-                content_type = "text"
-                file_type = "txt"
+            if go_ahead:
 
-            if file_type.lower() in ["csv"]:
-                # will parse as table
-                interpret_as_table=True
-                text_output = TextParser(self).csv_file_handler(input_fp, file, interpret_as_table=True)
-                content_type = "text"
-                file_type = "csv"
-                if interpret_as_table:
-                    content_type = "table"
+                text_output = []
+                # increment and get new doc_id
+                if write_to_db_on == 1:
+                    self.library.doc_ID = self.library.get_and_increment_doc_id()
 
-            if file_type.lower() in ["json","jsonl"]:
-                # will parse each line item as separate entry
+                file_type = file.split(".")[-1]
 
-                interpret_as_table=False
-                keys = ["text"]
-                text_output = TextParser(self).jsonl_file_handler(input_fp,file,
-                                                                  key_list=keys,
-                                                                  interpret_as_table=interpret_as_table,
-                                                                  separator="\n")
-                content_type = "text"
-                file_type = "jsonl"
-                if interpret_as_table:
-                    content_type = "table"
+                # sub-routing by type of text file to appropriate handler
 
-            # consolidate into single function - breaking down output rows
+                if file_type.lower() in ["txt", "md"]:
+                    # will parse as text
+                    text_output = TextParser(self).text_file_handler (input_fp, file)
+                    content_type = "text"
+                    file_type = "txt"
 
-            if write_to_db_on == 1:
-                new_output, new_blocks, new_pages = self._write_output_to_db(text_output, file,
-                                                                             content_type=content_type,
-                                                                             file_type=file_type)
-            else:
-                new_output, new_blocks, new_pages = self._write_output_to_dict(text_output,file,
-                                                                               content_type=content_type,
-                                                                               file_type=file_type)
+                if file_type.lower() in ["csv"]:
+                    # will parse as table
+                    interpret_as_table=True
+                    text_output = TextParser(self).csv_file_handler(input_fp, file, interpret_as_table=True)
+                    content_type = "text"
+                    file_type = "csv"
+                    if interpret_as_table:
+                        content_type = "table"
 
+                if file_type.lower() in ["json","jsonl"]:
+                    # will parse each line item as separate entry
+
+                    interpret_as_table=False
+                    keys = ["text"]
+                    text_output = TextParser(self).jsonl_file_handler(input_fp,file,
+                                                                      key_list=keys,
+                                                                      interpret_as_table=interpret_as_table,
+                                                                      separator="\n")
+                    content_type = "text"
+                    file_type = "jsonl"
+                    if interpret_as_table:
+                        content_type = "table"
+
+                # consolidate into single function - breaking down output rows
+
+                if write_to_db_on == 1:
+                    new_output, new_blocks, new_pages = self._write_output_to_db(text_output, file,
+                                                                                 content_type=content_type,
+                                                                                 file_type=file_type)
+                else:
+                    new_output, new_blocks, new_pages = self._write_output_to_dict(text_output,file,
+                                                                                   content_type=content_type,
+                                                                                   file_type=file_type)
+
+                # will pass output_blocks as return value
                 output += new_output
 
-            docs_added += 1
-            blocks_created += new_blocks
-            pages_added += new_pages
+                docs_added += 1
+                blocks_created += new_blocks
+                pages_added += new_pages
 
         # update overall library counter at end of parsing
 
-        if len(text_output) > 0:
+        if len(output) > 0:
             if write_to_db_on == 1:
                 dummy = self.library.set_incremental_docs_blocks_images(added_docs=docs_added,added_blocks=blocks_created,
                                                                         added_images=0, added_pages=pages_added)
@@ -1026,9 +1486,15 @@ class Parser:
             if save_history and write_to_db_on == 0:
                 ParserState().save_parser_output(self.parser_job_id, self.parser_output)
 
+            if copy_to_library:
+                self.uploads(input_fp)
+
         return output
 
-    def parse_pdf_by_ocr_images(self, input_fp, write_to_db=True, save_history=True):
+    def parse_pdf_by_ocr_images(self, input_fp, write_to_db=True, save_history=True,
+                                dupe_check=False,copy_to_library=False):
+
+        """ Alternative PDF parser option for scanned 'image-based' PDFs where digital parsing is not an option. """
 
         output = []
 
@@ -1049,7 +1515,7 @@ class Parser:
         if write_to_db and not self.parse_to_db:
             logging.error("warning: Parser().parse_text - could not connect to database at %s.  Will write "
                           "parsing output to file and will place the file in /parser_history path.",
-                          LLMWareConfig.get_config("collection_db_uri"))
+                          self.collection_path)
 
         # set counters
         blocks_added = 0
@@ -1060,20 +1526,30 @@ class Parser:
 
         for file in os.listdir(input_fp):
 
-            ext = file.split(".")[-1]
-            if ext == "pdf":
-                doc_fn = secure_filename(file)
+            # by default, will process all files with text file extensions
+            go_ahead = True
 
-                # get new doc_ID number
-                if write_to_db_on == 1:
-                    self.library.doc_ID = self.library.get_and_increment_doc_id()
+            if dupe_check:
 
-                docs_added += 1
+                #   basic_library_duplicate_check returns TRUE if it finds the file
+                if self.basic_library_duplicate_check(file):
+                    go_ahead = False
 
-                output_by_page = ImageParser(self).process_pdf_by_ocr(input_fp, file)
+            if go_ahead:
 
-                for i, pages in enumerate(output_by_page):
-                    for j, blocks in enumerate(pages):
+                ext = file.split(".")[-1]
+                if ext == "pdf":
+                    doc_fn = secure_filename(file)
+
+                    # get new doc_ID number
+                    if write_to_db_on == 1:
+                        self.library.doc_ID = self.library.get_and_increment_doc_id()
+
+                    docs_added += 1
+
+                    output_by_page = ImageParser(self).process_pdf_by_ocr(input_fp, file)
+
+                    for j, blocks in enumerate(output_by_page):
 
                         if write_to_db_on == 1:
                             new_output, new_blocks, _ = self._write_output_to_db(blocks,doc_fn,page_num=(j+1))
@@ -1084,6 +1560,8 @@ class Parser:
                         blocks_added += new_blocks
                         pages_added += 1
 
+                        print("update: writing doc - page - ", file, j, len(blocks))
+
         # update overall library counter at end of parsing
 
         if write_to_db_on == 1:
@@ -1093,9 +1571,14 @@ class Parser:
         if save_history and write_to_db_on == 0:
             ParserState().save_parser_output(self.parser_job_id, self.parser_output)
 
+        if copy_to_library:
+            self.uploads(input_fp)
+
         return output
 
     def _write_output_to_db(self, output, file, content_type="text", file_type="text",page_num=1):
+
+        """ Internal utility for preparing parser output to write to DB. """
 
         db_record_output = []
 
@@ -1134,6 +1617,8 @@ class Parser:
 
     def _write_output_to_dict(self, wp_output, input_fn, content_type="text", file_type="text", page_num=1):
 
+        """ Internal utility for preparing parser output to dictionary. """
+
         output = []
         # consolidate output
         counter = 0
@@ -1170,6 +1655,8 @@ class Parser:
     def add_create_new_record(self, library, new_entry, meta, coords_dict,dialog_value="false",
                               write_to_db=True):
 
+        """ Main 'write' method of new parser text chunk for python-based parsers to write to DB. """
+
         # assumes that new_entry is packaged in individual handler
         # objective is to keep one single place where new entry gets loaded into db
         # ensure consistency of db data model
@@ -1182,7 +1669,8 @@ class Parser:
             "content_type": new_entry[0],
             "file_type": new_entry[1],
             "master_index": new_entry[2][0],
-            "master_index2": new_entry[2][1:],
+            # change from [1:] to [1]
+            "master_index2": new_entry[2][1],
             "coords_x": coords_dict["coords_x"],
             "coords_y": coords_dict["coords_y"],
             "coords_cx": coords_dict["coords_cx"],
@@ -1203,16 +1691,20 @@ class Parser:
             "special_field2": new_entry[18],
             "special_field3": new_entry[19],
             "graph_status": "false",
-            "dialog": dialog_value
+            "dialog": dialog_value,
+            "embedding_flags": {}
         }
 
         if write_to_db:
             # registry_id = library.collection.insert_one(new_entry).inserted_id
-            registry_id = CollectionWriter(library.collection).write_new_record(new_entry)
+            registry_id = CollectionWriter(library.library_name,
+                                           account_name=library.account_name).write_new_parsing_record(new_entry)
 
         return new_entry
 
     def create_one_parsing_output_dict(self, block_id,new_entry, meta, coords_dict,dialog_value="false"):
+
+        """ Main method to prepare a new text chunk parser output for python-based parser as dictionary. """
 
         #   Mirrors the data structure in "self.add_create_new_record"
         #   --does not write_to_db or storage
@@ -1229,7 +1721,8 @@ class Parser:
             "content_type": new_entry[0],
             "file_type": new_entry[1],
             "master_index": new_entry[2][0],
-            "master_index2": new_entry[2][1:],
+            # change from [1:] to [1]
+            "master_index2": new_entry[2][1],
             "coords_x": coords_dict["coords_x"],
             "coords_y": coords_dict["coords_y"],
             "coords_cx": coords_dict["coords_cx"],
@@ -1250,12 +1743,15 @@ class Parser:
             "special_field2": new_entry[18],
             "special_field3": new_entry[19],
             "graph_status": "false",
-            "dialog": dialog_value
+            "dialog": dialog_value,
+            "embedding_flags": ""
         }
 
         return new_entry
 
     def parse_wiki(self, topic_list, write_to_db=True, save_history=False, target_results=10):
+
+        """ Main entry point to parse a Wikipedia article. """
 
         output = []
 
@@ -1275,7 +1771,7 @@ class Parser:
         if write_to_db and not self.parse_to_db:
             logging.error("warning: Parser().parse_text - could not connect to database at %s.  Will write "
                           "parsing output to file and will place the file in /parser_history path.",
-                          LLMWareConfig.get_config("collection_db_uri"))
+                          self.collection_path)
 
         # set counters
         blocks_added = 0
@@ -1337,7 +1833,9 @@ class Parser:
 
         return output
 
-    def parse_image(self, input_folder, write_to_db=True, save_history=True):
+    def parse_image(self, input_folder, write_to_db=True, save_history=True, dupe_check=False,copy_to_library=False):
+
+        """ Main entry point for OCR based parsing of image files. """
 
         output = []
 
@@ -1357,7 +1855,7 @@ class Parser:
         if write_to_db and not self.parse_to_db:
             logging.error("warning: Parser().parse_text - could not connect to database at %s.  Will write "
                           "parsing output to file and will place the file in /parser_history path.",
-                          LLMWareConfig.get_config("collection_db_uri"))
+                          self.collection_path)
 
         # set counters
         blocks_added = 0
@@ -1366,23 +1864,35 @@ class Parser:
 
         for file in os.listdir(input_folder):
 
-            # increment and get new doc_id
-            if write_to_db_on == 1:
-                self.library.doc_ID = self.library.get_and_increment_doc_id()
+            # by default, will process all files with text file extensions
+            go_ahead = True
 
-            ip_output = ImageParser(self).process_ocr(input_folder, file)
+            if dupe_check:
 
-            if write_to_db_on == 1:
-                new_output, new_blocks, new_pages = self._write_output_to_db(ip_output,file,content_type="text",
-                                                                             file_type="ocr")
-            else:
-                new_output, new_blocks, new_pages = self._write_output_to_dict(ip_output,file, content_type="text",
-                                                                               file_type="ocr")
+                #   basic_library_duplicate_check returns TRUE if it finds the file
+                if self.basic_library_duplicate_check(file):
+                    go_ahead = False
+
+            if go_ahead:
+
+                # increment and get new doc_id
+                if write_to_db_on == 1:
+                    self.library.doc_ID = self.library.get_and_increment_doc_id()
+
+                ip_output = ImageParser(self).process_ocr(input_folder, file)
+
+                if write_to_db_on == 1:
+                    new_output, new_blocks, new_pages = self._write_output_to_db(ip_output,file,content_type="text",
+                                                                                 file_type="ocr")
+                else:
+                    new_output, new_blocks, new_pages = self._write_output_to_dict(ip_output,file, content_type="text",
+                                                                                   file_type="ocr")
+                # return output value in either case
                 output += new_output
 
-            docs_added += 1
-            blocks_added += new_blocks
-            pages_added += new_pages
+                docs_added += 1
+                blocks_added += new_blocks
+                pages_added += new_pages
 
         if write_to_db_on == 1:
             dummy = self.library.set_incremental_docs_blocks_images(added_docs=docs_added, added_blocks=blocks_added,
@@ -1391,9 +1901,14 @@ class Parser:
         if save_history and write_to_db_on == 0:
             ParserState().save_parser_output(self.parser_job_id, self.parser_output)
 
+        if copy_to_library:
+            self.uploads(input_folder)
+
         return output
 
-    def parse_voice(self, input_folder, write_to_db=True, save_history=True):
+    def parse_voice(self, input_folder, write_to_db=True, save_history=True, dupe_check=False,copy_to_library=False):
+
+        """ Main entry point for parsing voice wav files. """
 
         output = []
 
@@ -1413,7 +1928,7 @@ class Parser:
         if write_to_db and not self.parse_to_db:
             logging.error("warning: Parser().parse_text - could not connect to database at %s.  Will write "
                           "parsing output to file and will place the file in /parser_history path.",
-                          LLMWareConfig.get_config("collection_db_uri"))
+                          self.collection_path)
 
         # set counters
         blocks_added = 0
@@ -1422,23 +1937,35 @@ class Parser:
 
         for file in os.listdir(input_folder):
 
-            # increment and get new doc_id
-            if write_to_db_on == 1:
-                self.library.doc_ID = self.library.get_and_increment_doc_id()
+            # by default, will process all files with text file extensions
+            go_ahead = True
 
-            vp_output = VoiceParser(self).add_voice_file(input_folder, file)
+            if dupe_check:
 
-            if write_to_db_on == 1:
-                new_output, new_blocks, new_pages = self._write_output_to_db(vp_output, file, content_type="text",
-                                                                             file_type="voice-wav")
-            else:
-                new_output, new_blocks, new_pages = self._write_output_to_dict(vp_output,file, content_type="text",
-                                                                               file_type="voice-wav")
+                #   basic_library_duplicate_check returns TRUE if it finds the file
+                if self.basic_library_duplicate_check(file):
+                    go_ahead = False
+
+            if go_ahead:
+
+                # increment and get new doc_id
+                if write_to_db_on == 1:
+                    self.library.doc_ID = self.library.get_and_increment_doc_id()
+
+                vp_output = VoiceParser(self).add_voice_file(input_folder, file)
+
+                if write_to_db_on == 1:
+                    new_output, new_blocks, new_pages = self._write_output_to_db(vp_output, file, content_type="text",
+                                                                                 file_type="voice-wav")
+                else:
+                    new_output, new_blocks, new_pages = self._write_output_to_dict(vp_output,file, content_type="text",
+                                                                                   file_type="voice-wav")
+                # return output in either case
                 output += new_output
 
-            docs_added += 1
-            blocks_added += new_blocks
-            pages_added += new_pages
+                docs_added += 1
+                blocks_added += new_blocks
+                pages_added += new_pages
 
         if write_to_db_on == 1:
             dummy = self.library.set_incremental_docs_blocks_images(added_docs=docs_added, added_blocks=blocks_added,
@@ -1447,9 +1974,14 @@ class Parser:
         if save_history and write_to_db_on == 0:
             ParserState().save_parser_output(self.parser_job_id, self.parser_output)
 
+        if copy_to_library:
+            self.uploads(input_folder)
+
         return output
 
-    def parse_dialog(self, input_folder, write_to_db=True, save_history=True):
+    def parse_dialog(self, input_folder, write_to_db=True, save_history=True, dupe_check=False,copy_to_library=True):
+
+        """ Main entry point for parsing AWS dialog transcripts. """
 
         output = []
 
@@ -1469,7 +2001,7 @@ class Parser:
         if write_to_db and not self.parse_to_db:
             logging.error("warning: Parser().parse_text - could not connect to database at %s.  Will write "
                           "parsing output to file and will place the file in /parser_history path.",
-                          LLMWareConfig.get_config("collection_db_uri"))
+                          self.collection_path)
 
         # set counters
         conversation_turns = 0
@@ -1478,53 +2010,66 @@ class Parser:
 
         for file in os.listdir(input_folder):
 
-            if file.endswith(".json"):
+            # by default, will process all files with text file extensions
+            go_ahead = True
 
-                # increment and get new doc_id
-                if write_to_db_on == 1:
-                    self.library.doc_ID = self.library.get_and_increment_doc_id()
+            if dupe_check:
 
-                logging.info(f"update: dialog file - {file}")
+                #   basic_library_duplicate_check returns TRUE if it finds the file
+                if self.basic_library_duplicate_check(file):
+                    go_ahead = False
 
-                dp_parse_output = DialogParser(self).parse_aws_json_file_format(input_folder, file)
+            if go_ahead:
 
-                block_id = 0
+                if file.endswith(".json"):
 
-                for i, blocks in enumerate(dp_parse_output):
-
-                    logging.info(f"update: dialog turn - {i} {blocks}")
-                  
-                    # iterate thru each block -> add to metadata
-                    speaker_name = blocks["speaker_name"]
-
-                    meta = {"author": speaker_name, "modified_date": "", "created_date": "", "creator_tool": ""}
-
-                    coords_dict = {"coords_x": blocks["start_time"], "coords_y": blocks["stop_time"],
-                                   "coords_cx": 0, "coords_cy": 0}
-
-                    text_entry = blocks["text"]
-
-                    # conforming file format with full path of dialog intake path
-
-                    format_type = "aws_json"
-
-                    new_entry = ("text", format_type, (1, 0), counter, "", "", input_folder + file,
-                                 text_entry, text_entry, "", "", text_entry, text_entry, "", text_entry,
-                                 "", "", "", "", "")
-
-                    counter += 1
-                    dialog_transcripts_added += 1
-                    conversation_turns += 1
-
+                    # increment and get new doc_id
                     if write_to_db_on == 1:
-                        output = self.add_create_new_record(self.library, new_entry, meta, coords_dict,
-                                                            dialog_value="true")
-                        self.library.block_ID += 1
-                    else:
-                        entry_output = self.create_one_parsing_output_dict(block_id,new_entry,meta,coords_dict,
-                                                                           dialog_value="true")
-                        block_id += 1
-                        self.parser_output.append(output)
+                        self.library.doc_ID = self.library.get_and_increment_doc_id()
+
+                    logging.info(f"update: dialog file - {file}")
+
+                    dp_parse_output = DialogParser(self).parse_aws_json_file_format(input_folder, file)
+
+                    block_id = 0
+
+                    for i, blocks in enumerate(dp_parse_output):
+
+                        logging.info(f"update: dialog turn - {i} {blocks}")
+
+                        # iterate thru each block -> add to metadata
+                        speaker_name = blocks["speaker_name"]
+
+                        meta = {"author": speaker_name, "modified_date": "", "created_date": "", "creator_tool": ""}
+
+                        coords_dict = {"coords_x": blocks["start_time"], "coords_y": blocks["stop_time"],
+                                       "coords_cx": 0, "coords_cy": 0}
+
+                        text_entry = blocks["text"]
+
+                        # conforming file format with full path of dialog intake path
+
+                        format_type = "aws_json"
+
+                        new_entry = ("text", format_type, (1, 0), counter, "", "", input_folder + file,
+                                     text_entry, text_entry, "", "", text_entry, text_entry, "", text_entry,
+                                     "", "", "", "", "")
+
+                        counter += 1
+                        dialog_transcripts_added += 1
+                        conversation_turns += 1
+
+                        if write_to_db_on == 1:
+                            entry_output = self.add_create_new_record(self.library, new_entry, meta, coords_dict,
+                                                                      dialog_value="true")
+                            self.library.block_ID += 1
+                        else:
+                            entry_output = self.create_one_parsing_output_dict(block_id,new_entry,meta,coords_dict,
+                                                                               dialog_value="true")
+                            block_id += 1
+                            self.parser_output.append(entry_output)
+
+                        # return output in either case
                         output.append(entry_output)
 
         pages_added = dialog_transcripts_added
@@ -1535,15 +2080,18 @@ class Parser:
                                                                     added_images=0,
                                                                     added_pages=pages_added)
 
-            self.uploads(input_folder)
+            # by default copies transcripts to upload folder
+            if copy_to_library:
+                self.uploads(input_folder)
 
         if save_history and write_to_db_on == 0:
             ParserState().save_parser_output(self.parser_job_id, self.parser_output)
 
         return output
 
-    # entry point for website handler should come through Parser class
     def parse_website(self, url_base, write_to_db=True, save_history=True, get_links=True, max_links=10):
+
+        """ Main entrypoint for parsing a website. """
 
         output = []
 
@@ -1563,7 +2111,7 @@ class Parser:
         if write_to_db and not self.parse_to_db:
             logging.error("warning: Parser().parse_website - could not connect to database at %s.  Will write "
                           "parsing output to file and will place the file in /parser_history path.",
-                          LLMWareConfig.get_config("collection_db_uri"))
+                          self.collection_path)
 
         local_work_folder = self.parser_tmp_folder
         # local_work_folder = self.library.tmp_path
@@ -1738,7 +2286,9 @@ class Parser:
 
         return output
 
-    def uploads(self, tmp_dir):
+    def uploads(self, tmp_dir, overwrite=False):
+
+        """ Utility method that handles 'uploads' of input files into library structure. """
 
         # designed for upload of input files into library structure
 
@@ -1749,18 +2299,23 @@ class Parser:
             return -1
 
         upload_fp = self.library.file_copy_path
-
+        library_files = os.listdir(upload_fp)
         files = os.listdir(tmp_dir)
         for x in range(0, len(files)):
             safe_name = self.prep_filename(files[x])
 
             # exclude any folders
             if not os.path.isdir(os.path.join(tmp_dir,files[x])):
-                shutil.copy(os.path.join(tmp_dir, files[x]), os.path.join(upload_fp, files[x]))
+
+                #   will not over-write an existing file unless overwrite flag set
+                if overwrite or files[x] not in library_files:
+                    shutil.copy(os.path.join(tmp_dir, files[x]), os.path.join(upload_fp, files[x]))
 
         return len(files)
 
     def prep_filename(self, fn, secure_name=True, prepend_string=None, postpend_string=None, max_len=None):
+
+        """ Utility function to prepare 'safe' filenames """
 
         fn_out = fn
 
@@ -1786,6 +2341,12 @@ class Parser:
 
     def input_ingestion_comparison (self, file_list):
 
+        # shortcut if file_list is just empty
+        if len(file_list) < 1:
+            return [],[]
+
+        """ Compares input with parsed output to identify any rejected files. """
+
         # simple approach - compares input file_list from ingestion 'work_order' with state of library collection
         #   --if input file found, then added to 'found_list' -> else, added to 'not_found_list'
 
@@ -1796,29 +2357,25 @@ class Parser:
             return -1
 
         found_list = []
-        not_found_list = []
 
-        doc_fn_raw_list = CollectionRetrieval(self.library.collection).get_distinct_list("file_source")
+        doc_fn_raw_list = CollectionRetrieval(self.library_name,
+                                              account_name=self.account_name).get_distinct_list("file_source")
 
-        doc_fn_out = []
+
         for i, file in enumerate(doc_fn_raw_list):
-            doc_fn_out.append(file.split(os.sep)[-1])
+            if file.split(os.sep)[-1] in file_list:
+                found_list.append(file.split(os.sep)[-1])
+            # if found_list is equal length of file_list we don't need to look any further
+            if len(found_list) == len(file_list):
+                break
 
-        for i, input_file in enumerate(file_list):
-            found_file = -1
-            for j, ingested_file in enumerate(doc_fn_out):
-
-                # need to confirm 'symmetrical' transformations, e.g., secure_filename and any prepend/postpend
-                if input_file == ingested_file:
-                    found_file = 1
-                    found_list.append(input_file)
-                    break
-            if found_file == -1:
-                not_found_list.append(input_file)
+        not_found_list = list(set(file_list) - set(found_list))
 
         return found_list, not_found_list
 
     def input_ingestion_comparison_from_parser_state (self, file_list):
+
+        """ Compares input with parsed output to identify any rejected files. """
 
         # simple approach - compares input file_list from ingestion 'work_order' with state of library collection
         #   --if input file found, then added to 'found_list' -> else, added to 'not_found_list'
@@ -1849,7 +2406,7 @@ class Parser:
 
     def parse_one (self, fp, fn, save_history=True):
 
-        # new method for 'ad hoc' 'unbound' parsing of a single document in memory -> no library required
+        """ Parse one 'ad hoc' 'unbound' parsing of a single document in memory -> no library required """
 
         # check that path exists
         if not os.path.exists(os.path.join(fp, fn)):
@@ -1882,6 +2439,8 @@ class Parser:
         return output
 
     def parse_one_office (self, fp, fn, save_history=True):
+
+        """ Parse one office document at selected file path and file name. """
 
         #   Designed for 'ad hoc' and 'unbound' quick parse of a single office document with no storage
         #   --output provided as list of Dicts in memory with same structure as parsing output
@@ -1921,6 +2480,9 @@ class Parser:
         # char * workspace_fp,
         # char * image_fp,
         # char * write_to_filename
+
+        #   if any issue loading module, will be captured at .get_module_office_parser()
+        _mod = Utilities().get_module_office_parser()
 
         main_handler = _mod.add_one_office
         main_handler.argtypes = (c_char_p, c_char_p, c_char_p, c_char_p, c_char_p, c_char_p, c_char_p)
@@ -1984,6 +2546,8 @@ class Parser:
 
     def parse_one_pdf (self, fp, fn,  save_history=True):
 
+        """ Parse one pdf document at selected file path and file name. """
+
         # check that path exists
         if not os.path.exists(os.path.join(fp,fn)):
             raise FilePathDoesNotExistException(os.path.join(fp,fn))
@@ -1996,6 +2560,9 @@ class Parser:
         # char * input_images_fp,
         # char * write_to_filename,
         # int user_block_size)
+
+        #   if any issue loading module, will be captured at .get_module_pdf_parser()
+        _mod_pdf = Utilities().get_module_pdf_parser()
 
         pdf_handler = _mod_pdf.add_one_pdf
 
@@ -2073,6 +2640,8 @@ class Parser:
 
     def parse_one_pdf_by_ocr_images(self, input_fp, input_fn, save_history=True):
 
+        """ Parse one 'scanned' pdf document at selected file path and file name. """
+
         # check that path exists
         if not os.path.exists(os.path.join(input_fp, input_fn)):
             raise FilePathDoesNotExistException(os.path.join(input_fp,input_fn))
@@ -2119,6 +2688,8 @@ class Parser:
 
     def parse_one_image(self, input_fp, input_fn, save_history=True):
 
+        """ Parse one image document at selected file path and file name. """
+
         #   Designed to parse a single image using OCR - no storage or link to library
 
         # check that path exists
@@ -2159,7 +2730,7 @@ class Parser:
 
     def parse_one_text(self, input_fp, input_fn, save_history=True):
 
-        #   Designed as single document parse with no storage or linkage into library
+        """ Parse one text-based document at selected file path and file name. """
 
         # check that path exists
         if not os.path.exists(os.path.join(input_fp, input_fn)):
@@ -2238,6 +2809,8 @@ class Parser:
 
     def parse_one_dialog(self, input_fp, input_fn, save_history=True):
 
+        """ Parse one dialog transcript document at selected file path and file name. """
+
         #   Designed as single dialog parse - no storage or link to library
         #   --note:  only supports AWS dialog standard for now
 
@@ -2251,11 +2824,11 @@ class Parser:
 
         ext = input_fn.split(".")[-1].lower()
 
-        if ext == ".json":
+        if ext == "json":
 
-            output = DialogParser(self).parse_aws_json_file_format(input_fp, input_fn)
+            dp_output = DialogParser(self).parse_aws_json_file_format(input_fp, input_fn)
 
-            for i, blocks in enumerate(output):
+            for i, blocks in enumerate(dp_output):
 
                 # iterate thru each block -> add to metadata
                 speaker_name = blocks["speaker_name"]
@@ -2292,6 +2865,8 @@ class Parser:
         return output
 
     def parse_one_voice(self, input_fp, input_fn, save_history=True):
+
+        """ Parse one WAV document at selected file path and file name. """
 
         #   Designed to parse a single WAV/voice file - no storage or linkage to library
 
@@ -2332,6 +2907,8 @@ class Parser:
 
     def query_parser_state(self, query, results=None, remove_stop_words=True):
 
+        """ Runs an in-memory 'fast search' against a set of parsed output json dictionaries. """
+
         if not results:
             results = self.parser_output
 
@@ -2339,8 +2916,280 @@ class Parser:
 
         return output
 
+    # update 012924 - new methods start here for duplicate checking
+
+    def input_build_folder(self, fp_list, exclude_if_already_in_library=True):
+
+        """ Creates a single 'input_build_folder' by consolidating the files across multiple folders, provided in
+        input list of file paths.   It will accept only one copy of a particular file, based on the
+        first version passed in the fp_list.  If exclude_if_already_in_library == True (default), then
+        any files already in the library will also be excluded. """
+
+        #   once the input_build_folder is created, it can be passed to any parsing method
+
+        library_docs = None
+
+        if not self.library:
+            exclude_if_already_in_library = False
+
+        if exclude_if_already_in_library:
+
+            # will get a list of all of the distinct files already in the library
+            library_docs = CollectionRetrieval(self.library_name,
+                                               account_name=self.account_name).get_distinct_list("file_source")
+
+        # create tmp workspace for new_input_folder
+        new_input_folder = os.path.join(self.parser_folder, "input_build" + os.sep)
+
+        #   if new_input_folder already created, then delete
+        if os.path.exists(new_input_folder):
+            shutil.rmtree(new_input_folder)
+
+        #   create and start fresh
+        if not os.path.exists(new_input_folder):
+            os.mkdir(new_input_folder)
+            os.chmod(new_input_folder, 0o777)
+
+        deduped_list = []
+        dupe_files = []
+        lib_match_list = []
+
+        for folder in fp_list:
+
+            input_files = os.listdir(folder)
+
+            for file in input_files:
+                if file not in deduped_list:
+                    dupe = 0
+                    if exclude_if_already_in_library:
+                        for lib_file in library_docs:
+                            if os.sep in lib_file:
+                                lib_file = lib_file.split(os.sep)[-1]
+                            if file == lib_file:
+                                dupe = 1
+                                lib_match_list.append(file)
+                                break
+                    if dupe == 0:
+                        deduped_list.append(file)
+                        shutil.copy(os.path.join(folder,file), os.path.join(new_input_folder,file))
+                else:
+                    # copies the full path of the file that is being excluded
+                    dupe_files.append(os.path.join(folder, file))
+
+        output_info = {"new_input_folder": new_input_folder,
+                       "file_count": len(deduped_list),
+                       "files_included": deduped_list,
+                       "duplicates_removed":dupe_files,
+                       "files_in_library_already": lib_match_list}
+
+        return output_info
+
+    def delete_input_build_folder(self):
+
+        """ Deletes an input build folder - at end of parsing transaction(s) using input_builder_folder """
+
+        input_build_folder = os.path.join(self.parser_folder, "input_build" + os.sep)
+
+        #   if new_input_folder already created, then delete
+        if os.path.exists(input_build_folder):
+            shutil.rmtree(input_build_folder)
+
+        return True
+
+    def duplicate_file_already_in_library(self, fp):
+
+        """ Reviews the files in input folder path, and checks if any of those files have blocks of information
+        in the library database collection. """
+
+        existing_docs_in_collection = CollectionRetrieval(self.library_name,
+                                                          account_name=self.account_name).get_distinct_list("file_source")
+
+        input_files = os.listdir(fp)
+
+        no_dupes_list = []
+        matching_file_names = []
+
+        for file in input_files:
+
+            match_found = 0
+
+            for existing_file in existing_docs_in_collection:
+
+                if os.sep in existing_file:
+                    # split to get base file name
+                    existing_file = existing_file.split(os.sep)[-1]
+
+                if file == existing_file:
+                    matching_file_names.append(file)
+                    match_found = 1
+                    break
+
+            if match_found == 0:
+                no_dupes_list.append(file)
+
+        duplicate_check = {"not_in_library": no_dupes_list, "in_library": matching_file_names}
+
+        return duplicate_check
+
+    def basic_library_duplicate_check(self, fn):
+
+        """ Checks if file is already part of the copied upload files for the library, and returns
+        True if file is found, and False if not found, e.g., 'new' to the library """
+
+        in_library = False
+
+        # run comparison with existing files in library copy path
+        if self.library:
+            if os.path.exists(self.library.file_copy_path):
+                existing_files = os.listdir(self.library.file_copy_path)
+
+                if fn in existing_files:
+                    in_library = True
+
+        return in_library
+
+    def parse_csv_config(self,fp, fn, cols=None, mapping_dict=None):
+
+        """ Designed for intake of a 'pseudo-db csv table' and will add rows to library with mapped keys.
+
+        Inputs:
+            -- csv folder path + csv file name
+            -- cols = # of expected column entries in each row of the CSV
+            -- mapping dict = assigns key names to columns, starting with 0 for first column
+                e.g., {"text": 4, "doc_ID": 2, "key1": 3}
+
+        Requirements:
+            -- must have a "text" key in the mapping dictionary
+            -- optional doc_ID and block_ID - if found, will over-write the normal library indexes
+            -- all other keys will be saved as 'metadata' and added to the library block row in "special_field1"
+
+        Note: this feature is currently only supported for Mongo - SQL DB support will follow.
+        """
+
+        # method requires Mongo DB and a library loaded in the Parser
+        if LLMWareConfig().get_config("collection_db") != "mongo" or not self.library:
+            raise LLMWareException(message="Parsing of a configured CSV file requires (a) use of MongoDB as "
+                                           "the text collection parsing database, and (b) a library object to "
+                                           "be connected to the parser state.")
+
+        #   if found in mapping dict, then will over-write
+        reserved_keys = ["text", "doc_ID", "block_ID"]
+
+        rejected_rows = []
+        ds = []
+
+        if not mapping_dict:
+            raise LLMWareException(message="Parsing of a configured CSV file requires a mapping dictionary so that "
+                                           "the table attributes can be properly mapped.")
+
+        if not cols:
+            raise LLMWareException(message="Parsing of a configured CSV file requires a defined column structure and "
+                                           "a specified number of columns to ensure accurate mapping.")
+
+        # will iterate through csv file
+        input_csv = os.path.join(fp, fn)
+
+        import csv
+        record_file = open(input_csv, "r", encoding='utf-8-sig',errors='ignore')
+        c = csv.reader(record_file, dialect='excel', doublequote=False, delimiter=',')
+        output = []
+
+        #   Should be OK to load in memory up to ~1M rows - beyond that, will need to implement iterator
+
+        for lines in c:
+            output.append(lines)
+        record_file.close()
+
+        added_row_count = 0
+        total_row_count = 0
+        added_doc_count = 0
+
+        for i, rows in enumerate(output):
+
+            text = ""
+            doc_id = None
+            block_id = None
+            metadata = {}
+
+            if len(rows) != cols:
+                bad_entry = {"index": i, "row": rows}
+                rejected_rows.append(bad_entry)
+
+            else:
+                # confirmed that row has the correct number of entries
+
+                for keys, values in mapping_dict.items():
+
+                    if keys == "text":
+                        if mapping_dict["text"] < len(rows):
+                            text = rows[mapping_dict["text"]]
+
+                    if keys == "doc_ID":
+                        if mapping_dict["doc_ID"] < len(rows):
+                            doc_id = rows[mapping_dict["doc_ID"]]
+
+                    if keys == "block_ID":
+                        if mapping_dict["block_ID"] < len(rows):
+                            block_id = rows[mapping_dict["block_ID"]]
+
+                    if keys not in reserved_keys:
+                        if values < len(rows):
+                            metadata.update({keys:rows[values]})
+
+            if text.strip():
+
+                meta = {"author": "", "modified_date": "", "created_date": "", "creator_tool": ""}
+                coords_dict = {"coords_x": 0, "coords_y": 0, "coords_cx": 0, "coords_cy": 0}
+
+                # conforming file format with full path of dialog intake path
+
+                new_row_entry = ("text", "custom_csv", (1, 0), total_row_count, "", "", fn,
+                                 text, text, "", "", text, text, "", text, "", "", metadata, "", "")
+
+                #   set attributes custom
+                if doc_id:
+                    try:
+                        self.library.doc_ID = int(doc_id)
+                        added_doc_count += 1
+                    except:
+                        logging.warning("update: doc_ID expected to be integer - can not apply custom doc ID -"
+                                        "will use default library document increment")
+
+                if block_id:
+                    self.library.block_ID = block_id
+                else:
+                    self.library.block_ID += 1
+
+                #   write row to database
+                entry_output = self.add_create_new_record(self.library,
+                                                          new_row_entry,
+                                                          meta,
+                                                          coords_dict,
+                                                          dialog_value="false")
+                added_row_count += 1
+
+            total_row_count += 1
+
+        # update overall library counter at end of parsing
+
+        if len(output) > 0:
+
+            if added_doc_count == 0:
+                added_doc_count += 1
+
+            dummy = self.library.set_incremental_docs_blocks_images(added_docs=added_doc_count,
+                                                                    added_blocks=added_row_count,
+                                                                    added_images=0, added_pages=0)
+
+        output = {"rows_added": len(ds), "rejected_count": len(rejected_rows), "rejected_rows": rejected_rows}
+
+        return output
+
 
 class WebSiteParser:
+
+    """ WebSiteParser implements a website-scraping parser.   It can be accessed directly, or in many cases, will
+    be accessed through Parser or Library classes indirectly. """
 
     def __init__(self, url_or_fp, link="/", save_images=True, reset_img_folder=False, local_file_path=None,
                  from_file=False, text_only=False):
@@ -2382,7 +3231,7 @@ class WebSiteParser:
         if from_file:
             # interpret url as file_path and file_name
             try:
-                html = open(url_or_fp, encoding='utf-8', errors='ignore').read()
+                html = open(url_or_fp, encoding='utf-8-sig', errors='ignore').read()
                 bs = BeautifulSoup(html, features="lxml")
                 self.html = bs.findAll()
                 success_code = 1
@@ -2432,6 +3281,8 @@ class WebSiteParser:
         self.success_code = success_code
 
     def website_main_processor(self, img_start, output_index=True):
+
+        """ Main processing of HTML scraped content and converting into blocks. """
 
         output = []
         counter = 0
@@ -2612,6 +3463,8 @@ class WebSiteParser:
 
     def link_handler(self, elements):
 
+        """ Handles processing of links found in main page content. """
+
         link_out = ""
         link_type = ""
         js_skip = 0
@@ -2652,6 +3505,8 @@ class WebSiteParser:
         return js_skip, link_out, link_type
 
     def image_handler(self, img_extension, elements, img_counter):
+
+        """ Handles and processes images found in main content. """
 
         success = -1
         img_raw = []
@@ -2698,8 +3553,9 @@ class WebSiteParser:
 
         return success, img_raw, full_url, image_name
 
-    # called in two different places
     def _save_image(self, img_raw, fp):
+
+        """ Internal utility to save images found. """
 
         with open(fp, 'wb') as f:
             img_raw.decode_content = True
@@ -2708,6 +3564,8 @@ class WebSiteParser:
         return 0
 
     def _save_image_website(self, fp, img_num, doc_id, save_file_path):
+
+        """ Internal utility for images. """
 
         # internal method to save image files and track counters
 
@@ -2730,6 +3588,8 @@ class WebSiteParser:
 
     # called by main handler
     def _request_image(self, img_extension, img):
+
+        """ Retrieve images from links. """
 
         # relative link - refers back to main index page
         # check if url_main gives better performance than .url_base
@@ -2756,6 +3616,8 @@ class WebSiteParser:
 
     # not called by the main handler - keep as direct callable method
     def get_all_links(self):
+
+        """ Utility to retrieve all links. """
 
         internal_links = []
         external_links = []
@@ -2822,6 +3684,8 @@ class WebSiteParser:
     # not called by main handler - keep as separate standalone method
     def get_all_img(self, save_dir):
 
+        """ Utility to get all images from html pages. """
+
         counter = 0
         for content in self.html:
             counter += 1
@@ -2858,6 +3722,8 @@ class WebSiteParser:
 
 class ImageParser:
 
+    """ ImageParser for handling OCR of scanned documents - may be called directly, or through Parser. """
+
     def __init__(self, parser=None, library=None, text_chunk_size=600, look_back_range=300):
 
         self.parser = parser
@@ -2877,6 +3743,8 @@ class ImageParser:
 
     def process_ocr (self, dir_fp, fn, preserve_spacing=False):
 
+        """ Process a single OCR file in 'dir_fp' and with filename 'fn'. """
+
         try:
             text_out = pytesseract.image_to_string(os.path.join(dir_fp,fn))
         except TesseractNotFoundError as e:
@@ -2893,6 +3761,8 @@ class ImageParser:
         return text_chunks
 
     def ocr_to_single_text_file(self,fp):
+
+        """ Runs OCR and converts image files into a single text file. """
 
         # simple utility method to extract text directly from set of images in folder
         #   --will consolidate into a single text list
@@ -2911,6 +3781,8 @@ class ImageParser:
         return text_list_out
 
     def process_pdf_by_ocr(self, input_fp, file):
+
+        """ Handles special case of running page-by-page OCR on a scanned PDF document. """
 
         text_output_by_page = []
 
@@ -2936,6 +3808,8 @@ class ImageParser:
         return text_output_by_page
 
     def exif_extractor(self, fp):
+
+        """ Special utility to extract exif metadata from photos. """
 
         #  exif metadata is present in most photos, but not all
         #  if not a photo, it will not have exif data (e.g., camera standard)
@@ -2991,6 +3865,8 @@ class ImageParser:
 
     def convert_pdf_to_images_by_page(self, input_fp, output_fp, summary_text_fn= "text_summary.txt"):
 
+        """ Converts scanned PDF file into Page-by-Page images. """
+
         # converts pdf files into set of .png images by page
         #   --will process all of the pdf files in the input_fp
 
@@ -3036,6 +3912,8 @@ class ImageParser:
 
 class VoiceParser:
 
+    """ VoiceParser handles wav files to convert into text blocks. """
+
     def __init__(self, parser=None, library=None, text_chunk_size=600, look_back_range=300):
 
         self.parser = parser
@@ -3058,8 +3936,8 @@ class VoiceParser:
 
     def load_speech_to_text_model(self, speech_model=None, speech_tokenizer=None):
 
-        """ * llmware does not ship with a built-in speech-to-text engine * """
-        """ * This is in our roadmap - and we will prioritize based on feedback from the community. * """
+        """ Warning: llmware does not ship with a built-in speech-to-text engine - speech model dependency must
+         be loaded separately. """
 
         #   Here is a sample script to import a popular speech-to-text engine in conjunction with llmware:
         #
@@ -3085,6 +3963,8 @@ class VoiceParser:
     # current script easy to adapt to other speech models - designed for Wav2Vec
     def voice_to_text(self,fp_input, fn, sr_input=16000):
 
+        """Voice to text parsing conversion. Requires loading of separate dependency. """
+
         if not self.speech_model:
             raise DependencyNotInstalledException("speech_to_text_model")
 
@@ -3106,6 +3986,8 @@ class VoiceParser:
 
     def add_voice_file(self, input_fp, fn):
 
+        """ Parse voice file. """
+
         #   16000 is standard default encoding rate for .wav -> will need to test/experiment
         text_out = self.voice_to_text(input_fp, fn, 16000)
 
@@ -3118,6 +4000,8 @@ class VoiceParser:
 
 
 class TextParser:
+
+    """ TextParser to parse .txt, .json, .csv, and .md files - can be called directly or through main Parser class. """
 
     def __init__(self, parser=None, library=None, text_chunk_size=600, look_back_range=300):
 
@@ -3139,11 +4023,13 @@ class TextParser:
     def jsonl_file_handler (self, dir_fp,sample_file, key_list=None, interpret_as_table=False,
                             separator="\n"):
 
+        """ Parse JSONL file. """
+
         # will extract each line in jsonl as separate sample
         #   --based on key_list and interpret_as_table
 
         output = []
-        my_file = open(os.path.join(dir_fp, sample_file), 'r', encoding='utf-8')
+        my_file = open(os.path.join(dir_fp, sample_file), 'r', encoding='utf-8-sig',errors='ignore')
 
         if not key_list:
             # as default, if no key_list, then look for "text" attribute in jsonl by default
@@ -3171,7 +4057,9 @@ class TextParser:
 
     def text_file_handler (self, dir_fp, sample_file):
 
-        text_out = open(os.path.join(dir_fp,sample_file), encoding='utf-8', errors='ignore').read()
+        """ Parse .txt file. """
+
+        text_out = open(os.path.join(dir_fp,sample_file), "r", encoding='utf-8-sig', errors='ignore').read()
 
         # will chop up the long text into individual text chunks
         text_chunks = TextChunker(text_chunk=text_out,
@@ -3181,6 +4069,8 @@ class TextParser:
         return text_chunks
 
     def csv_file_handler (self, dir_fp,sample_file, max_rows=100, interpret_as_table=True):
+
+        """ Parse .csv file. """
 
         if interpret_as_table:
 
@@ -3206,7 +4096,7 @@ class TextParser:
 
         else:
             # chunk and split as a big piece of text
-            raw_csv = open(os.path.join(dir_fp,sample_file), encoding='utf-8', errors='ignore').read()
+            raw_csv = open(os.path.join(dir_fp,sample_file), "r", encoding='utf-8-sig', errors='ignore').read()
             # replace ',' & '\n' & '\r' with spaces
             text_out = re.sub("[,\n\r]", " ", raw_csv)
 
@@ -3219,6 +4109,8 @@ class TextParser:
 
 
 class WikiParser:
+
+    """ WikiParser handles the retrieval and packaging of content from Wikipedia. """
 
     def __init__(self, parser=None, library=None, text_chunk_size=600, look_back_range=300):
 
@@ -3240,6 +4132,8 @@ class WikiParser:
                 self.look_back_range = 300
 
     def add_wiki_topic(self, topic, target_results=10):
+
+        """ Parse a selected Wikipedia content by topic and requested target results. """
 
         # used in both Parser / Library, as well as directly in Prompts (integrate as "Source" into Prompt)
 
@@ -3273,6 +4167,8 @@ class WikiParser:
 
 class DialogParser:
 
+    """ DialogParser handles parsing of dialog voice transcription, specifically for AWS currently. """
+
     def __init__(self, parser=None, library=None, text_chunk_size=600, look_back_range=300):
 
         self.parser = parser
@@ -3296,7 +4192,9 @@ class DialogParser:
     # map to aws transcript json output format
     def parse_aws_json_file_format(self, input_folder, fn_json):
 
-        f = json.load(open(os.path.join(input_folder, fn_json), "r", encoding='utf-8'))
+        """ Parse AWS JSON file. """
+
+        f = json.load(open(os.path.join(input_folder, fn_json), "r", encoding='utf-8-sig',errors='ignore'))
 
         # aws standard call transcript format:  ["results"]["items"] -> key conversation elements to aggregate
         #   note:  we will need many more documents for testing

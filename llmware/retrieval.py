@@ -1,4 +1,3 @@
-
 # Copyright 2023 llmware
 
 # Licensed under the Apache License, Version 2.0 (the "License"); you
@@ -12,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 # implied.  See the License for the specific language governing
 # permissions and limitations under the License.
+"""The retrieval module implements the Query class.
+
+The query class executes queries against vector databases and depends on a library object.
+"""
 
 
 import logging
@@ -30,10 +33,79 @@ from llmware.exceptions import LibraryObjectNotFoundException,UnsupportedEmbeddi
 
 
 class Query:
+    """Implements the query capabilities against a ``library``.
 
+    Query is responsible for executing queries against an indexed library. The library can be semantic, text, custom,
+    or hybrid. A query object requires a library object as input, which will be the source of the query.
+
+    Parameters
+    ----------
+    library : object
+        A ``library`` object.
+
+    embedding_model : object, default=None
+        An ``embedding_model`` object.
+
+    tokenizer : object, default=None
+
+    vector_db_api_key : str, default=None
+        The API key for the vector store.
+
+    query_id : int, default=None
+        The identifier for a query. This is used when a query state has to be loaded.
+
+    from_hf : bool, default=False
+        Sets whether the embedding model should be loaded from hugging face.
+
+    from_sentence_transformer: bool, default=False
+        Sets whether the embedding model should be loaded from ``LLMWareSemanticModel``.
+
+    embedding_model_name : str, default=None
+        The name of the embedding model. This has to be set if ``from_sentence_transformer=True``.
+
+    save_history : bool, default=True
+        Sets whether the history of queries should be saved.
+
+    query_mode : str, default=None
+        Sets the query mode that should be used. It has to be either 'text', 'semantic', or 'hybrid'.
+
+    vector_db : str, default=None
+        The name of the vector store to be queried against. If it is not set, then this is determined by the
+        given ``embedding_model``.
+
+
+    Examples
+    ----------
+    >>> from llmware.library import Library
+    >>> from llmware.retrieval import Query
+    >>> library = Library().create_new_library('lib_semantic_query')
+    >>> library.add_website(url='https://en.wikipedia.org/wiki/Austria', get_links=False)
+    >>> library.install_new_embedding(embedding_model_name="industry-bert-sec", vector_db="milvus", batch_size=500)
+    >>> query = Query(library=library)
+    >>> results = query.semantic_query(query='the capital of austria is', result_count=3)
+    >>> len(results)
+    3
+    >>> results[0].keys()
+    dict_keys(['query', '_id', 'text', 'doc_ID', 'block_ID', 'page_num', 'content_type',
+               'author_or_speaker', 'special_field1', 'file_source', 'added_to_collection',
+               'table', 'coords_x', 'coords_y', 'coords_cx', 'coords_cy', 'external_files',
+               'score', 'similarity', 'distance', 'matches', 'account_name', 'library_name'])
+    >>> results[0]['query']
+    'the capital of austria is'
+    >>> results[0]['text']
+    'Austria is a parliamentary representative democracy with a popularly elected president as head of '
+    'state and a chancellor as head of government and chief executive. Major cities include Vienna , Graz, '
+    'Linz , Salzburg , and Innsbruck . Austria has the 17th highest nominal GDP per capita with high '
+    'standards of living; it was ranked 25th in the world for its Human Development Index in 2021. '
+    >>> results[2]['text']
+    "Austrian Parliament Building Vienna The Parliament of Austria is located in Vienna , the country's capital "
+    "and most populous city. Austria became a federal , representative democratic republic through the "
+    "Federal Constitutional Law of 1920. The political system of the Second Republic with its nine federal "
+    "states is based on the constitution of 1920, amended in 1929, which was re-enacted on 1 May 1945. [108] "
+    """
     def __init__(self, library, embedding_model=None, tokenizer=None, vector_db_api_key=None,
                  query_id=None, from_hf=False, from_sentence_transformer=False,embedding_model_name=None,
-                 save_history=True, query_mode=None, vector_db=None):
+                 save_history=True, query_mode=None, vector_db=None, model_api_key=None):
 
         # load user profile & instantiate core library assets linked to profile
 
@@ -65,6 +137,7 @@ class Query:
         self.embedding_model = None
         self.embedding_db = None
         self.embeddings = None
+        self.model_api_key = model_api_key
 
         if self.library:
             self.embeddings = EmbeddingHandler(self.library)
@@ -180,6 +253,8 @@ class Query:
 
     def load_embedding_model(self):
 
+        """ Loads the embedding model pulled from the embedding_record of the library. """
+
         # skip if already instantiated self.embedding_model
 
         if not self.embedding_model:
@@ -195,7 +270,8 @@ class Query:
 
             else:
                 if ModelCatalog().lookup_model_card(self.embedding_model_name):
-                    self.embedding_model = ModelCatalog().load_model(selected_model=self.embedding_model_name)
+                    self.embedding_model = ModelCatalog().load_model(selected_model=self.embedding_model_name,
+                                                                     api_key=self.model_api_key)
                 else:
                     logging.info("update: Query - selected embedding model could not be found- %s ",
                                     self.embedding_model_name)
@@ -203,10 +279,14 @@ class Query:
         return self
 
     def get_output_keys(self):
-        # list of keys that will be provided in each query_result
+
+        """ Returns list of keys that will be provided in each query_result. """
+
         return self.query_result_return_keys
 
     def set_output_keys(self, result_key_list):
+
+        """ Sets the list of keys that will be returned in each query_result. """
 
         # set the output keys
         validated_list = []
@@ -227,6 +307,8 @@ class Query:
 
     def start_query_session(self, query_id=None):
 
+        """ Initiates a query session and will capture potentially multiple related queries in single state. """
+
         if query_id:
             self.query_id = query_id
 
@@ -238,6 +320,8 @@ class Query:
         return query_id
 
     def register_query (self, retrieval_dict):
+
+        """ Registers a query to the query state. """
 
         # qr_dict = ["query", "results", "doc_ID", "file_source"]
 
@@ -260,19 +344,30 @@ class Query:
         return self
 
     def load_query_state(self, query_id):
+
+        """ Loads a query state of a previous query by query_id """
+
         state = QueryState(self).load_state(query_id)
         return self
 
     def save_query_state(self):
+
+        """ Saves the current query state. """
+
         QueryState(self).save_state()
         return self
 
     def clear_query_state(self):
+
+        """ Resets the query state. """
+
         # need to reset state variables
         QueryState(self).initiate_new_state_session()
         return self
 
     def dump_current_query_state(self):
+
+        """ Dumps the current query_state to a query_state_dict. """
 
         query_state_dict = {"query_id": self.query_id,
                             "query_history": self.query_history,
@@ -284,6 +379,10 @@ class Query:
         return query_state_dict
 
     def query(self, query, query_type="text", result_count=20, results_only=True):
+
+        """ Main method for executing a basic query - expects query as input, and optional parameters for
+        query_type, result_count and whether results_only.  Output is a set of query results, which is a list of
+        dictionaries, with each dictionary representing a single matching retrieval from the collection. """
 
         output_result = {"results": [], "doc_ID": [], "file_source": []}
 
@@ -311,12 +410,14 @@ class Query:
     # basic simple text query method - only requires entering the query
     def text_query (self, query, exact_mode=False, result_count=20, exhaust_full_cursor=False, results_only=True):
 
+        """ Execute a basic text query. """
+
         # prepare query if exact match required
         if exact_mode:
             query = self.exact_query_prep(query)
 
         # query the text collection
-        cursor = CollectionRetrieval(self.library.collection).basic_query(query)
+        cursor = CollectionRetrieval(self.library_name,account_name=self.account_name).basic_query(query)
 
         # package results, with correct sample counts and output keys requested
         results_dict = self._cursor_to_qr(query, cursor,result_count=result_count,exhaust_full_cursor=
@@ -329,6 +430,8 @@ class Query:
 
     def text_query_with_document_filter(self, query, doc_filter, result_count=20, exhaust_full_cursor=False,
                                         results_only=True, exact_mode=False):
+
+        """ Execute a text query with a document filter applied. """
 
         # prepare query if exact match required
         if exact_mode:
@@ -350,11 +453,11 @@ class Query:
                             "'file_source' - as a safe fall-back - will run the requested query without a filter.")
 
         if key:
-            cursor = CollectionRetrieval(self.library.collection). \
+            cursor = CollectionRetrieval(self.library_name, account_name=self.account_name). \
                     text_search_with_key_value_range(query, key, value_range)
         else:
             # as fallback, if no key found, then run query without filter
-            cursor = CollectionRetrieval(self.library.collection).basic_query(query)
+            cursor = CollectionRetrieval(self.library_name, account_name=self.account_name).basic_query(query)
 
         result_dict = self._cursor_to_qr(query, cursor, result_count=result_count,
                                          exhaust_full_cursor=exhaust_full_cursor)
@@ -366,17 +469,23 @@ class Query:
 
     def text_query_by_content_type (self, query, content_type,results_only=True):
 
+        """ Execute a text query with additional constraint of content type, e.g., 'image', 'table', or 'text' """
+
         filter_dict = {"content_type": content_type}
         retrieval_dict = self.text_query_with_custom_filter(query,filter_dict,results_only=True)
         return retrieval_dict
 
     def image_query(self, query, results_only=True):
 
+        """ Execute a query with content_type == 'image'. """
+
         filter_dict = {"content_type": "image"}
         retrieval_dict = self.text_query_with_custom_filter(query, filter_dict,results_only=True)
         return retrieval_dict
 
     def table_query(self, query, export_tables_to_csv=False, results_only=True):
+
+        """ Execute a query with content_type == 'table'. """
 
         filter_dict = {"content_type": "table"}
         retrieval_dict = self.text_query_with_custom_filter(query, filter_dict,results_only=True)
@@ -393,12 +502,14 @@ class Query:
 
     def text_search_by_page (self, query, page_num=1, results_only=True):
 
+        """ Execute a text search with page number constraint provided as page_num parameter. """
+
         key = "master_index"  # parsing uses "master_index" across multiple input sources, interpret as "page_num"
 
         if not isinstance(page_num, list):
             page_num = [page_num]
 
-        cursor_results = CollectionRetrieval(self.library.collection).\
+        cursor_results = CollectionRetrieval(self.library_name, account_name=self.account_name).\
             text_search_with_key_value_range(query, key, page_num)
 
         retrieval_dict = self._cursor_to_qr(query, cursor_results)
@@ -410,12 +521,16 @@ class Query:
 
     def text_query_by_author_or_speaker(self, query, author_or_speaker, results_only=True):
 
+        """ Execute a text query with specific author_or_speaker constraint. """
+
         filter_dict = {"author_or_speaker": author_or_speaker}
         retrieval_dict = self.text_query_with_custom_filter(query,filter_dict,results_only=results_only)
         return retrieval_dict
 
     def text_query_with_custom_filter (self, query, filter_dict, result_count=20,
                                        exhaust_full_cursor=False, results_only=True):
+
+        """ Execute a text query with additional custom filter dictionary. """
 
         # filter_dict is a dict with indefinite number of key:value pairs - each key will be interpreted
         #   as "$and" in the query, requiring a match against all of the key:values in the filter_dict
@@ -428,7 +543,7 @@ class Query:
                     validated_filter_dict.update({key:values})
 
         if validated_filter_dict:
-            cursor = CollectionRetrieval(self.library.collection).\
+            cursor = CollectionRetrieval(self.library_name, account_name=self.account_name).\
                 text_search_with_key_value_dict_filter(query,validated_filter_dict)
 
         else:
@@ -448,6 +563,8 @@ class Query:
 
     def _cursor_to_qr_with_secondary_filter(self, query, cursor_results, filter_dict,
                                             result_count=20, exhaust_full_cursor=False):
+
+        """ Internal helper method to package query results from cursor. """
 
         qr = []
         counter = 0
@@ -519,6 +636,8 @@ class Query:
 
     def _cursor_to_qr (self, query, cursor_results, result_count=20, exhaust_full_cursor=False):
 
+        """ Internal helper method to package query results from cursor. """
+
         qr = []
         counter = 0
         doc_id_list = []
@@ -577,6 +696,8 @@ class Query:
         # basic semantic query
     def semantic_query(self, query, result_count=20, embedding_distance_threshold=None, custom_filter=None, results_only=True):
 
+        """ Main method to execute a semantic query - only required parameter is the query. """
+
         if not embedding_distance_threshold:
             embedding_distance_threshold = self.semantic_distance_threshold
 
@@ -622,15 +743,19 @@ class Query:
         return results_dict["results"] if results_only else results_dict
 
     def apply_custom_filter(self, results, custom_filter):
+
+        """ Apply custom filter to a set of results. """
+
         filtered_results = []
         for result in results:
             if all(result.get(key) == value for key, value in custom_filter.items()):
                 filtered_results.append(result)
         return filtered_results
 
-    # basic semantic query
     def semantic_query_with_document_filter(self, query, filter_dict, embedding_distance_threshold=None,
                                             result_count=100, results_only=True):
+
+        """ Execute semantic query with secondary constraint of document filter. """
 
         #   checks for filter to offer option to do semantic query in specific doc, page or content range
         if not embedding_distance_threshold:
@@ -680,6 +805,11 @@ class Query:
 
     def similar_blocks_embedding(self, block, result_count=20, embedding_distance_threshold=10, results_only=True):
 
+        """ Application of semantic embedding space - takes a block of text as input and finds most similar comparable
+        text chunks. If you are comfortable with the normalization of the embedding vector space, then set a
+        specific embedding_distance_threshold, e.g., embedding_distance_threshold=1.1 to limit the results to
+        text blocks within a distance of 1.1 in the embedding space."""
+
         # will use embedding to find similar blocks from a given block
         # confirm that embedding model exists, or catch and raise error
         if self.embedding_model:
@@ -721,7 +851,10 @@ class Query:
         return results_dict
 
     def dual_pass_query(self, query, result_count=20, primary="text", safety_check=True, custom_filter=None, results_only=True):
-        
+
+        """ Executes a combination of text and semantic queries and attempts to interweave and re-rank based on
+        correspondence between the two query attempts. """
+
         # safety check
         if safety_check and result_count > 100:
             logging.warning("warning: Query().dual_pass_query runs a comparison of output rankings using semantic "
@@ -730,6 +863,12 @@ class Query:
                             "safety_check to False in the method declaration, or (2) keep sample count below 100.")
             result_count = 100
 
+        # following keys are required for dual pass query to work, add them if user has omitted them
+        keys_to_check = ['_id', 'doc_ID']
+        for key in keys_to_check:
+            if key not in self.query_result_return_keys:
+                self.query_result_return_keys.append(key)
+        
         # run dual pass - text + semantic
         # Choose appropriate text query method based on custom_filter
         if custom_filter:
@@ -804,6 +943,8 @@ class Query:
 
     def augment_qr (self, query_result, query_topic, augment_query="semantic"):
 
+        """ Augments the set of query results using alternative retrieval strategy. """
+
         if augment_query == "semantic":
             qr_aug = self.semantic_query(query_topic,result_count=20, results_only=True)
         else:
@@ -826,6 +967,8 @@ class Query:
         return updated_qr
 
     def apply_semantic_ranking(self, qr, issue_semantic):
+
+        """ Apply ranking of query results by semantic query ranking. """
 
         #   designed to take a set of query results, and re-rank the order of results by their semantic distance
         #   --note:  possible to use a different query term for issue_semantic than the original query result
@@ -851,6 +994,8 @@ class Query:
 
     def document_filter (self, filter_topic, query_mode="text", result_count=30,
                          exact_mode = False, exhaust_full_cursor=True):
+
+        """ Takes a filter_topic as input, along with query_mode, and generates a document filter as output. """
 
         result_dict = None
 
@@ -884,6 +1029,8 @@ class Query:
 
     def page_lookup(self, page_list=None, doc_id_list=None, text_only=False):
 
+        """ Look up by specific pages, e.g, useful to retrieve the entire first page of a template document. """
+
         if not doc_id_list:
             doc_id_list = self.list_doc_id()
         else:
@@ -904,7 +1051,7 @@ class Query:
         else:
             page_dict = {"doc_ID": {"$in":doc_id_list}, "master_index": {"$in": page_list}}
 
-        cursor_results = CollectionRetrieval(self.library.collection).filter_by_key_dict(page_dict)
+        cursor_results = CollectionRetrieval(self.library_name, account_name=self.account_name).filter_by_key_dict(page_dict)
 
         output = []
 
@@ -920,7 +1067,11 @@ class Query:
     # new method to extract whole library
     def get_whole_library(self, selected_keys=None):
 
-        match_results = CollectionRetrieval(self.library.collection).get_whole_collection()
+        """ Gets the whole library - and will return as a list in-memory. """
+
+        match_results_cursor = CollectionRetrieval(self.library_name, account_name=self.account_name).get_whole_collection()
+
+        match_results = match_results_cursor.pull_all()
 
         qr = []
 
@@ -950,6 +1101,8 @@ class Query:
     # new method to generate csv files for each table entry
     def export_all_tables(self, query="", output_fp=None):
 
+        """ Exports all tables, with query option to limit the list from a library. """
+
         table_csv_files_created = []
 
         if not output_fp:
@@ -957,11 +1110,11 @@ class Query:
 
         if not query:
 
-            match_results = CollectionRetrieval(self.library.collection).filter_by_key("content_type","table")
+            match_results = CollectionRetrieval(self.library_name, account_name=self.account_name).filter_by_key("content_type","table")
 
         else:
             kv_dict = {"content_type": "table"}
-            match_results = CollectionRetrieval(self.library.collection).\
+            match_results = CollectionRetrieval(self.library_name, account_name=self.account_name).\
                 text_search_with_key_value_dict_filter(query,kv_dict)
 
         counter = 0
@@ -1043,6 +1196,8 @@ class Query:
 
     def export_one_table_to_csv(self, query_result, output_fp=None, output_fn=None):
 
+        """ Exports a single table query result into a csv file. """
+
         table = query_result["table"]
 
         output = []
@@ -1109,28 +1264,88 @@ class Query:
 
     def list_doc_id(self):
 
-        # utility function - returns list of all doc_ids in the library
-        doc_id_list = CollectionRetrieval(self.library.collection).get_distinct_list("doc_ID")
+        """ Utility function - returns list of all doc_ids in the library. """
+
+        doc_id_list = CollectionRetrieval(self.library_name, account_name=self.account_name).get_distinct_list("doc_ID")
 
         return doc_id_list
 
     def list_doc_fn(self):
 
-        # utility function -returns list of all document names in the library
-        doc_fn_raw_list = CollectionRetrieval(self.library.collection).get_distinct_list("file_source")
+        """ Utility function - returns list of all document names in the library. """
+
+        doc_fn_raw_list = CollectionRetrieval(self.library_name, account_name=self.account_name).get_distinct_list("file_source")
 
         doc_fn_out = []
         for i, file in enumerate(doc_fn_raw_list):
             doc_fn_out.append(file.split(os.sep)[-1])
         return doc_fn_out
 
+    def aggregate_text(self, qr_list):
+
+        """ Utility method that take a list of query result dictionaries as input (with all of the associated metadata
+        attributes) and repackages into two useful outputs:
+
+            -- text_agg, which is the aggregated text across all of the query results in a single unbroken string, and
+            -- meta_agg, which is a list of dictionaries with all of the 'start/stop' information in the text
+                string, which can be used to map back a snippet of text back to its original block entry in the DB.
+        """
+
+        text_agg = ""
+        meta_agg = []
+
+        for i, entry in enumerate(qr_list):
+            t = entry["text"]
+            meta = {"start_char": len(text_agg), "stop_char": len(text_agg) + len(t), "block_id": entry["block_ID"],
+                    "doc_ID": entry["doc_ID"], "page_num": entry["page_num"]}
+            meta_agg.append(meta)
+            text_agg += t
+
+        return text_agg, meta_agg
+
+    def document_lookup(self, doc_id="", file_source=""):
+
+        """ Takes as an input either a doc_id or file_source (e.g., filename) that is in a Library, and
+        returns all of the non-image text and table blocks in the document. """
+
+        if doc_id:
+            kv_dict = {"doc_ID": doc_id}
+        elif file_source:
+            kv_dict = {"file_source": file_source}
+        else:
+            raise RuntimeError("Query document_lookup method requires as input either a document ID or "
+                               "the name of a file already parsed in the library ")
+
+        output = CollectionRetrieval(self.library_name, account_name=self.account_name).filter_by_key_dict(kv_dict)
+
+        if len(output) == 0:
+            logging.warning(f"update: Query - document_lookup  - nothing found - {doc_id} - {file_source}")
+            result = []
+
+            return result
+
+        output_final = []
+
+        # exclude images to avoid potential duplicate text
+        for entries in output:
+            if entries["content_type"] != "image":
+                entries.update({"matches": []})
+                entries.update({"page_num": entries["master_index"]})
+                output_final.append(entries)
+
+        output_final = sorted(output_final, key=lambda x:x["block_ID"], reverse=False)
+
+        return output_final
+
     def block_lookup(self, block_id, doc_id):
+
+        """ Look up by a specific pair of doc_id and block_id in a library. """
 
         result = None
 
         kv_dict = {"doc_ID": doc_id, "block_ID": block_id}
 
-        output = CollectionRetrieval(self.library.collection).filter_by_key_dict(kv_dict)
+        output = CollectionRetrieval(self.library_name, account_name=self.account_name).filter_by_key_dict(kv_dict)
 
         if len(output) == 0:
             logging.info("update: Query - Library - block_lookup - block not found: %s ", block_id)
@@ -1152,9 +1367,11 @@ class Query:
 
     def get_header_text_from_collection(self, text_field="header_text"):
 
+        """ Pulls the header_text from the collection, captured during parsing, useful to identify headlines. """
+
         ds_folder = self.library.nlp_path
 
-        results = CollectionRetrieval(self.library.collection).get_whole_collection()
+        results = CollectionRetrieval(self.library_name, account_name=self.account_name).get_whole_collection()
 
         f = open(ds_folder + "header_text.txt", "w", encoding='utf-8')
         counter = 0
@@ -1173,9 +1390,11 @@ class Query:
 
     def get_core_text_from_collection(self, text_field="text"):
 
+        """ Returns all core text from a collection. """
+
         ds_folder = self.library.nlp_path
 
-        results = CollectionRetrieval(self.library.collection).get_whole_collection()
+        results = CollectionRetrieval(self.library_name, account_name=self.account_name).get_whole_collection()
 
         f = open(os.path.join(ds_folder,"core_text.txt"), "w", encoding='utf-8')
         counter = 0
@@ -1192,8 +1411,11 @@ class Query:
 
     def get_user_tags(self):
 
+        """ Returns user tags, if any, identified - note: this is experimental method and may change."""
+
         # look for all non-empty user_tags
-        output = CollectionRetrieval(self.library.collection).filter_by_key_ne_value("user_tags", "")
+        output = CollectionRetrieval(self.library_name,
+                                     account_name=self.account_name).filter_by_key_ne_value("user_tags", "")
 
         counter = 0
         user_tags_out = []
@@ -1204,6 +1426,8 @@ class Query:
         return user_tags_out
 
     def filter_by_time_stamp (self, qr, first_date="", last_date=""):
+
+        """ Filters results by condition of time range. """
 
         # apply filter dict to the qr results found
         time_str = "%Y-%m-%d"
@@ -1238,6 +1462,8 @@ class Query:
 
     def _time_window_filter(self, start_time,end_time, test_time, time_str="%a %b %d %H:%M:%S %Y"):
 
+        """ Internal helper function to evaluate and compare time stamps. """
+
         if start_time and end_time:
             if start_time <= test_time <= end_time:
                 return True
@@ -1254,6 +1480,8 @@ class Query:
 
     def locate_query_match (self, query, core_text):
 
+        """ Utility function to locate the character-level match of a query inside a core_text. """
+
         matches_found = []
         
         # edge case - but return empty match if query is null
@@ -1268,6 +1496,9 @@ class Query:
         for x in range(0, len(core_text)):
             match = 0
             for key_term in query_tokens:
+                if len(key_term) == 0:
+                    continue
+                
                 if key_term.startswith('"'):
                     key_term = key_term[1:-1]
 
@@ -1289,6 +1520,8 @@ class Query:
 
     def exact_query_prep(self, query):
 
+        """ Prepares an exact query prep. """
+
         if query.startswith('"') and query.endswith('"'):
             prepared_query = '\"' + query[1:-1] + '\"'
 
@@ -1299,6 +1532,8 @@ class Query:
         return prepared_query
 
     def bibliography_builder_from_qr(self, query_results):
+
+        """ Builds a bibliography from a query result. """
 
         bibliography = []
         doc_id_reviewed = []
@@ -1336,6 +1571,8 @@ class Query:
 
     def filter_cursor_list(self, cursor, filter_dict, sample_count=20, exhaust_full_cursor=None):
 
+        """ Applies filter to a cursor list. """
+
         validated_filter_dict = self.prep_validated_filter_dict(filter_dict)
         result_output = []
 
@@ -1355,6 +1592,8 @@ class Query:
 
     def prep_validated_filter_dict(self, filter_dict):
 
+        """ Internal utility to prepare a validated filter dict. """
+
         validated_filter_dict = {}
 
         for key, values in filter_dict.items():
@@ -1366,10 +1605,16 @@ class Query:
         return validated_filter_dict
 
     def block_lookup_by_collection_id(self, _id):
+
+        """ Block lookup using collection id key specifically. """
+
         # specific to Mongo lookup - uses mongo '_id' which needs to be wrapped in ObjectId
-        return CollectionRetrieval(self.library.collection).filter_by_key("_id", ObjectId(_id))
+        return CollectionRetrieval(self.library_name,
+                                   account_name=self.account_name).filter_by_key("_id", ObjectId(_id))
 
     def compare_text_blocks(self, t1, t2):
+
+        """ Token-by-token comparison of two text blocks. """
 
         b = CorpTokenizer(one_letter_removal=True, remove_numbers=True, remove_stop_words=True)
         tokens1 = b.tokenize(t1)
@@ -1390,6 +1635,8 @@ class Query:
 
     def block_similarity_retrieval_more_like_this (self, target_text, qr, similarity_threshold=0.25):
 
+        """ Block similarity by token comparison. """
+
         #   will rank and order a list of query results using a target text as the reference point
         output = []
 
@@ -1409,6 +1656,7 @@ class Query:
 
     def build_doc_id_fn_list(self, qr):
 
+        """ Utility function to build a doc_id and filename list. """
         doc_id_list = []
         fn_list = []
 
@@ -1420,6 +1668,8 @@ class Query:
         return doc_id_list, fn_list
 
     def expand_text_result_before(self, block, window_size=400):
+
+        """ Expands text result before. """
 
         block_id = block["block_ID"] -1
         doc_id = block["doc_ID"]
@@ -1439,7 +1689,9 @@ class Query:
 
         return output
 
-    def expand_text_result_after (self, block, window_size=400):
+    def expand_text_result_after(self, block, window_size=400):
+
+        """ Expands text result after. """
 
         block_id = block["block_ID"] + 1
         doc_id = block["doc_ID"]
@@ -1447,26 +1699,28 @@ class Query:
         after_text = ""
         post_blocks = []
 
-        while len(after_text) < window_size and block_id >= 0:
-
+        while len(after_text) < window_size:
             after_block = self.block_lookup(block_id, doc_id)
+            if not after_block:
+                break  # Break if no block is found
 
-            if after_block:
-                after_text += after_block["text"]
-                post_blocks.append(after_block)
+            after_text += after_block["text"]
+            post_blocks.append(after_block)
+            block_id += 1  # Increment block_id for next iteration
 
         output = {"expanded_text": after_text, "results": post_blocks}
-
         return output
 
     def generate_csv_report(self):
+        """Generates a csv report from the current query status. """
         output = QueryState(self).generate_query_report_current_state()
         return output
     
-    #   starting new method here
     def filter_by_key_value_range(self, key, value_range, results_only=True):
 
-        cursor = CollectionRetrieval(self.library.collection).filter_by_key_value_range(key,value_range)
+        """ Executes a filter by key value range. """
+
+        cursor = CollectionRetrieval(self.library_name, account_name=self.account_name).filter_by_key_value_range(key,value_range)
 
         query= ""
         result_dict = self._cursor_to_qr(query, cursor, exhaust_full_cursor=True)
